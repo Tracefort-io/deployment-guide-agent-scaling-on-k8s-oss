@@ -36,11 +36,14 @@ import sys
 
 CREDENTIALS = ["ANTHROPIC_API_KEY"]
 
-# Each value is read back from where the guide stored it. A conversation ID is the oldest actor of
-# that agent's template. The gateway's consumer key and the sign-in values are added here as the
-# steps that create them are written.
+# Each value is read back from where the guide stored it. The consumer key comes from the gateway's
+# Secret (Step 2). A conversation ID is the oldest actor of that agent's template. The sign-in
+# values are added here when the step that creates them is written.
 RESTORE = """\
 sec() { kubectl get secret "$2" -n "$1" -o jsonpath="{.data.$3}" 2>/dev/null | base64 --decode || true; }
+if kubectl get secret llm-virtual-keys -n agentgateway-system >/dev/null 2>&1; then
+  v=$(sec agentgateway-system llm-virtual-keys team-agents | jq -r .key); if [ -n "$v" ]; then export AGENT_CONSUMER_KEY=$v; fi
+fi
 oldest_conv() {
   kubectl-ate get actors -a kagent -o json 2>/dev/null \\
     | jq -r --arg t "$1-" '[.actors[]? | select(.actorTemplate.name // "" | test("^" + $t + "[0-9a-f]{12}$"))] | sort_by(.metadata.createTime) | .[0].metadata.name // empty' \\
