@@ -7,3 +7,9 @@ auto-build/.env.local
 auto-build/logs/
 kubeconfig
 *.kubeconfig
+
+# Editor swap and backup files, which can hold a copy of a credentials file
+*.swp
+*.swo
+*~
+.*.swp

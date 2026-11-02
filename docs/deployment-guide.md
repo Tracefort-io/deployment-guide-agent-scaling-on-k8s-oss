@@ -162,6 +162,8 @@ agent traffic reaches it, declare one agent, and prove its first answer went thr
 **What you will have that you did not have before:** an agent that holds no model key, whose
 sessions each run in their own sandbox, and whose every model call goes through one gateway.
 
+**Verified on:** a kind cluster created fresh for it (kind 0.32.0, `kindest/node:v1.35.0`), 2026-11-02 22:28 UTC: every block from the top of this guide to the end of Step 7 executed verbatim in one pass of `auto-build/run.sh` under bash, from an empty directory outside the repository, on the versions in Version support. Every output block in Up and Running comes from that run.
+
 ### Step 1: Create the cluster
 
 Substrate gives every control plane and worker pod a certificate through two Kubernetes APIs,
@@ -388,13 +390,14 @@ echo -n "no key:       "; curl -sS -o /dev/null -w '%{http_code}\n' http://127.0
 echo -n "consumer key: "; curl -sS http://127.0.0.1:18081/v1/messages \
   -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
   -H "x-api-key: ${AGENT_CONSUMER_KEY}" -d "$MSG" | jq -r '.content[0].text // .error.message'
-kill $GW_PF
+kill $GW_PF; wait $GW_PF 2>/dev/null || true
 ```
 
 **Verified on 2026-11-02:**
 
 ```text
-@@OUT step-2-gateway-check@@
+no key:       401
+consumer key: gateway ok
 ```
 
 A 401 with no key and an answer with the consumer key means the gateway is authenticating callers
@@ -441,7 +444,10 @@ fi
 **Verified on 2026-11-02:**
 
 ```text
-@@OUT install-clis@@
+kagent: OK
+kubectl-ate: OK
+{"backend_version":"unknown","build_date":"2026-10-30","git_commit":"eed2723","kagent_version":"1.0.0-rc1"}
+kubectl-ate version v1.0.0-rc1 commit=71b1f9ec80848f8fd46f5d5d7e6b84ba36a80966 built=2026-10-30T11:40:37-04:00 darwin/arm64
 ```
 
 Now install. `kagent install` creates the Substrate and kagent releases, a PostgreSQL that every
@@ -532,25 +538,25 @@ kubectl get workerpools.ate.dev -n kagent
 
 ```text
 NAME                                      READY   STATUS      RESTARTS   AGE
-ate-api-server-74f8b87bf9-b28gb           2/2     Running     0          91s
-ate-api-server-74f8b87bf9-cdksf           2/2     Running     0          91s
-ate-controller-c994f4b54-5jttp            1/1     Running     0          91s
-ate-idp-server-85748d8dd6-49t2g           1/1     Running     0          91s
-ate-idp-server-85748d8dd6-spkbg           1/1     Running     0          91s
-atelet-4wb4r                              2/2     Running     0          91s
-atenet-egress-654675ddfb-c97k5            1/1     Running     0          91s
-atenet-router-57d98fd5bf-92wtq            1/1     Running     0          91s
-k8s-credential-provider-fdbb6987b-8shld   1/1     Running     0          91s
-rustfs-5d695f5fd-n9c97                    1/1     Running     0          91s
-rustfs-bucket-init-qb4vp                  0/1     Completed   0          91s
+ate-api-server-74f8b87bf9-5ndxb           2/2     Running     0          98s
+ate-api-server-74f8b87bf9-xqbgk           2/2     Running     0          98s
+ate-controller-c994f4b54-qjkmq            1/1     Running     0          98s
+ate-idp-server-85748d8dd6-2w5zr           1/1     Running     0          98s
+ate-idp-server-85748d8dd6-rk4z2           1/1     Running     0          98s
+atelet-xjhg7                              2/2     Running     0          98s
+atenet-egress-654675ddfb-cm4z6            1/1     Running     0          98s
+atenet-router-57d98fd5bf-t797b            1/1     Running     0          98s
+k8s-credential-provider-fdbb6987b-4qxlm   1/1     Running     0          98s
+rustfs-5d695f5fd-2zd86                    1/1     Running     0          98s
+rustfs-bucket-init-g8cf4                  0/1     Completed   0          98s
 NAME                                 READY   STATUS    RESTARTS   AGE
-kagent-controller-875d9c8-v9hvx      1/1     Running   0          46s
-kagent-default-5ffdf9d9f7-5zrqn      1/1     Running   0          46s
-kagent-postgresql-8466db8889-lf2vj   2/2     Running   0          119s
-kagent-tools-787df48f55-zsmvp        1/1     Running   0          46s
-kagent-ui-6f5995c9b9-xkvj8           1/1     Running   0          46s
+kagent-controller-875d9c8-lvc2v      1/1     Running   0          45s
+kagent-default-5ffdf9d9f7-42gfj      1/1     Running   0          45s
+kagent-postgresql-8466db8889-gzdgc   2/2     Running   0          2m6s
+kagent-tools-787df48f55-psd9l        1/1     Running   0          45s
+kagent-ui-6f5995c9b9-5nff6           1/1     Running   0          45s
 NAME             DESIRED   REPLICAS   READY   SANDBOXCONFIG    RESOLVED   AGE
-kagent-default   1         1          1       gvisor-default   True       46s
+kagent-default   1         1          1       gvisor-default   True       45s
 ```
 
 `kagent-default` is the worker pool. Each worker is a pod that runs many sessions' sandboxes,
@@ -780,7 +786,7 @@ export FIRST_CONTEXT=$(echo "$TURN" | cut -f2)
 **Verified on 2026-11-02:**
 
 ```text
-@@OUT step-7-first-turn@@
+TASK_STATE_COMPLETED	01a19e63-dc01-7b0b-aa76-ca58c7aa1532	up and running
 ```
 
 `TASK_STATE_COMPLETED`, the session's ID, and the reply. An answer alone does not prove the call
@@ -826,7 +832,13 @@ kubectl logs -n agentgateway-system deployment/agentgateway-proxy --since=10m \
 **Verified on 2026-11-02:**
 
 ```text
-@@OUT step-7-gateway-log@@
+atenet-egress: 10.244.0.18
+route=agentgateway-system/anthropic-messages
+endpoint=api.anthropic.com:443
+src.addr=10.244.0.18:41332
+http.status=200
+gen_ai.usage.input_tokens=1849
+gen_ai.usage.output_tokens=6
 ```
 
 The call arrived from `atenet-egress`'s address, on the `anthropic-messages` route, and went on to
