@@ -81,6 +81,12 @@ export KIND_NODE_IMAGE=kindest/node:v1.35.0@sha256:4613778f3cfcd10e615029370f578
 export RUNTIME_IMAGE=ghcr.io/kagent-dev/kagent/golang-adk:1.0.0-rc1@sha256:5b06741be8cb69c9293477bdbf3203c6526127c533fa940fd9f595a82a801701
 export CLAUDE_HARNESS_IMAGE=ghcr.io/kagent-dev/kagent/claude-harness:1.0.0-rc1@sha256:359f8d8107df0ac5b0ebb306b0bc2e8d0ae0c3eae4540fe909724f1d8379dad5
 
+# The trace store, Step 10. In memory: traces are lost when its pod restarts.
+export JAEGER_IMAGE=jaegertracing/jaeger:2.12.0@sha256:4c8423cd8fa8b727bd632f0acda2cc39118f21a4bdcef322a6c9ddbeb6dcd424
+
+# The S3 client Step 12 uses to read the snapshot store.
+export AWS_CLI_IMAGE=amazon/aws-cli:2.17.0@sha256:643507c10ada7964ca6157b3d799f030b90577643da9955d319a77399ed80d73
+
 # Model provider. Anthropic is the reference provider.
 export ANTHROPIC_API_KEY='<your-anthropic-api-key>'
 export MODEL=claude-haiku-4-5
@@ -94,6 +100,7 @@ export KAGENT_UI_CREDENTIALS_FILE=${KAGENT_UI_CREDENTIALS_FILE:-$HOME/.kagent-ui
 # Local ports for the port-forwards.
 export KAGENT_API_PORT=${KAGENT_API_PORT:-18083}
 export KAGENT_UI_PORT=${KAGENT_UI_PORT:-14000}
+export JAEGER_PORT=${JAEGER_PORT:-16686}
 ```
 
 ### What you need before you start
@@ -538,25 +545,25 @@ kubectl get workerpools.ate.dev -n kagent
 
 ```text
 NAME                                      READY   STATUS      RESTARTS   AGE
-ate-api-server-74f8b87bf9-5ndxb           2/2     Running     0          98s
-ate-api-server-74f8b87bf9-xqbgk           2/2     Running     0          98s
-ate-controller-c994f4b54-qjkmq            1/1     Running     0          98s
-ate-idp-server-85748d8dd6-2w5zr           1/1     Running     0          98s
-ate-idp-server-85748d8dd6-rk4z2           1/1     Running     0          98s
-atelet-xjhg7                              2/2     Running     0          98s
-atenet-egress-654675ddfb-cm4z6            1/1     Running     0          98s
-atenet-router-57d98fd5bf-t797b            1/1     Running     0          98s
-k8s-credential-provider-fdbb6987b-4qxlm   1/1     Running     0          98s
-rustfs-5d695f5fd-2zd86                    1/1     Running     0          98s
-rustfs-bucket-init-g8cf4                  0/1     Completed   0          98s
+ate-api-server-74f8b87bf9-6lq4w           2/2     Running     0          2m14s
+ate-api-server-74f8b87bf9-vsjch           2/2     Running     0          2m14s
+ate-controller-c994f4b54-7hldf            1/1     Running     0          2m14s
+ate-idp-server-85748d8dd6-56mbz           1/1     Running     0          2m14s
+ate-idp-server-85748d8dd6-tkft7           1/1     Running     0          2m14s
+atelet-c29qh                              2/2     Running     0          2m14s
+atenet-egress-654675ddfb-b49ps            1/1     Running     0          2m14s
+atenet-router-57d98fd5bf-7jhkw            1/1     Running     0          2m14s
+k8s-credential-provider-fdbb6987b-sl4ds   1/1     Running     0          2m14s
+rustfs-5d695f5fd-hsmb4                    1/1     Running     0          2m14s
+rustfs-bucket-init-dn49v                  0/1     Completed   0          2m14s
 NAME                                 READY   STATUS    RESTARTS   AGE
-kagent-controller-875d9c8-lvc2v      1/1     Running   0          45s
-kagent-default-5ffdf9d9f7-42gfj      1/1     Running   0          45s
-kagent-postgresql-8466db8889-gzdgc   2/2     Running   0          2m6s
-kagent-tools-787df48f55-psd9l        1/1     Running   0          45s
-kagent-ui-6f5995c9b9-5nff6           1/1     Running   0          45s
+kagent-controller-875d9c8-ndg5t      1/1     Running   0          71s
+kagent-default-5ffdf9d9f7-pwpbq      1/1     Running   0          71s
+kagent-postgresql-8466db8889-v665k   2/2     Running   0          2m38s
+kagent-tools-787df48f55-c597m        1/1     Running   0          71s
+kagent-ui-6f5995c9b9-qt6ll           1/1     Running   0          71s
 NAME             DESIRED   REPLICAS   READY   SANDBOXCONFIG    RESOLVED   AGE
-kagent-default   1         1          1       gvisor-default   True       45s
+kagent-default   1         1          1       gvisor-default   True       71s
 ```
 
 `kagent-default` is the worker pool. Each worker is a pod that runs many sessions' sandboxes,
@@ -786,7 +793,7 @@ export FIRST_CONTEXT=$(echo "$TURN" | cut -f2)
 **Verified on 2026-11-02:**
 
 ```text
-TASK_STATE_COMPLETED	01a19e63-dc01-7b0b-aa76-ca58c7aa1532	up and running
+TASK_STATE_COMPLETED	01a19ea9-2405-73cc-94e0-8151075388c8	up and running
 ```
 
 `TASK_STATE_COMPLETED`, the session's ID, and the reply. An answer alone does not prove the call
@@ -832,10 +839,10 @@ kubectl logs -n agentgateway-system deployment/agentgateway-proxy --since=10m \
 **Verified on 2026-11-02:**
 
 ```text
-atenet-egress: 10.244.0.18
+atenet-egress: 10.244.0.17
 route=agentgateway-system/anthropic-messages
 endpoint=api.anthropic.com:443
-src.addr=10.244.0.18:41332
+src.addr=10.244.0.17:38160
 http.status=200
 gen_ai.usage.input_tokens=1849
 gen_ai.usage.output_tokens=6
@@ -853,33 +860,712 @@ the UI and API, or the snapshot store, from the rest of the cluster. Isolate clo
 
 ## OPERATE
 
+Up and Running proved one turn works. This section follows a session through its whole life,
+so that when something misbehaves you know which part to look at.
+
+**What you are going to do:** see what kagent created in Substrate for the agent, follow one
+session through two turns and a suspension, turn on tracing and read one turn end to end, inspect
+and act on its actor directly, find where its context is stored, delete it and check what is left,
+and run the same agent on a second runtime.
+
+**What you will have that you did not have before:** a working model of the agent lifecycle on this
+platform, and the commands to see each stage of it on your own cluster.
+
+**Verified on:** a kind cluster created fresh for it (kind 0.32.0, `kindest/node:v1.35.0`), 2026-11-02 23:43 UTC: every block from the top of this guide to the end of Step 14 executed verbatim in one pass of `auto-build/run.sh` under bash, from an empty directory outside the repository. Every output block in Operate comes from that run.
+
 ### Step 8: How an agent becomes actors
 
-*Not yet written.*
+Applying the `Agent` in Step 6 did not start a pod. kagent asked Substrate for an **actor template**:
+the image, the sandbox class and the egress policy every session with this agent will get.
+Substrate started one actor from it, let it initialize, and saved its volumes as a **golden
+snapshot**. That snapshot is what `Ready` meant.
+
+From here on, kubectl-ate's warning about the shared identity (Step 7) goes to `/dev/null`, so the
+output is only the answer. Leave it in when a call fails: errors go to the same stream.
+
+```bash run id=step-8-template
+kubectl-ate get actor-template -a kagent 2>/dev/null
+kubectl-ate get tags -a kagent 2>/dev/null
+```
+
+**Verified on 2026-11-02:**
+
+```text
+ATESPACE   NAME                     GOLDEN TAG                             ERROR   AGE
+kagent     assistant-ef2afecb25fc   417f09ac-0323-41cc-b065-be336531f7b3           18s
+ATESPACE   NAME                                   SCOPE                 STATE   SNAPSHOT                                                                               FIDELITY                    AGE
+kagent     417f09ac-0323-41cc-b065-be336531f7b3   TAG_SCOPE_PUBLISHED   Ready   gs://ate-snapshots/kagent/atespaces/kagent/tags/59ca8c00-3196-4fdf-a4c8-7a1aed1f4fe6   SNAPSHOT_FIDELITY_VOLUMES   3s
+```
+
+The template's `GOLDEN TAG` is a tag in the agent's own atespace, and the tag's snapshot is in the
+snapshot store beside the agent's sessions. Every agent you declare gets one of each. Its fidelity,
+`VOLUMES`, is the lowest Substrate offers: the snapshot holds the sandbox's durable volumes and
+not its process memory, so a session starts by booting the runtime image with those volumes in
+place. kagent asks for this fidelity for every template and every session, and it is not a
+setting.
+
+Then each session becomes its own **actor**, named `session-<session id>`, in the `kagent`
+atespace:
+
+```bash run id=step-8-actors
+kubectl-ate get actors -a kagent 2>/dev/null
+kubectl-ate get workers 2>/dev/null
+```
+
+**Verified on 2026-11-02:**
+
+```text
+ATESPACE   NAME                                           TEMPLATE                        STATE                   WORKER POD   WORKER IPS   VERSION   AGE
+kagent     session-01a19ea9-2405-73cc-94e0-8151075388c8   kagent/assistant-ef2afecb25fc   ACTOR_STATE_SUSPENDED   <none>                    5         1s
+NAME                                   POOL             STATE                 ACTORS   CPU(MILLICORES)   MEMORY         POD                                      AGE
+814d9ff9-7252-4614-ba17-65c793f79966   kagent-default   WORKER_STATE_ACTIVE   0/1000   0/6000            0/12154772Ki   kagent/kagent-default-5ffdf9d9f7-pwpbq   81s
+```
+
+Step 7's session is `SUSPENDED`, with no worker pod and no IP. It holds nothing on a worker
+until its next message. The worker reports the actors placed on it right now, which is none.
+
+There is no long-lived actor per agent. Ten sessions with one agent are ten actors, each
+started from the same golden snapshot, which is why Scale counts sessions rather than agents.
 
 ### Step 9: Follow one session
 
-*Not yet written.*
+Two helpers. `actor_events` reads atelet's log, where Substrate records every restore and
+checkpoint with its timing. `wait_suspended` polls the actor until it is suspended:
+
+```bash run id=step-9-helpers
+# actor_events <session id>: restores and checkpoints for that session's actor.
+actor_events() {
+  kubectl logs -n ate-system daemonset/atelet -c atelet --since=30m \
+    | jq -r --arg a "session-$1" 'select(."ate.actor.name" == $a and (.msg | test("timing breakdown")))
+        | [.time[11:23], .msg, ."ate.snapshot.kind" + "/" + ."ate.snapshot.fidelity",
+           (((."ate.actor.restore.duration.total" // ."ate.actor.checkpoint.duration.total") * 1000 | floor | tostring) + " ms")]
+        | @tsv'
+}
+
+# wait_suspended <session id>: block until the actor is suspended, at most 60s.
+wait_suspended() {
+  local waited=0 state
+  while [ "$waited" -lt 60 ]; do
+    state=$(kubectl-ate get actor "session-$1" -a kagent -o json 2>/dev/null | jq -r .status.state)
+    [ "$state" = ACTOR_STATE_SUSPENDED ] && { echo "suspended (polled ${waited}s after the reply)"; return 0; }
+    sleep 1; waited=$((waited + 1))
+  done
+  echo "still ${state} after 60s" >&2; return 1
+}
+```
+
+`daemonset/atelet` reads one atelet pod. On a single-node cluster that is the only one; on more
+nodes, read the pod on the node the actor ran on.
+
+Send the first turn of a new session, then watch its actor:
+
+```bash run id=step-9-turn-1
+TURN=$(kagent_send assistant "My project is called Larkspur. Reply with OK.")
+echo "$TURN"
+export CONV=$(echo "$TURN" | cut -f2)
+wait_suspended "$CONV"
+kubectl-ate get actor "session-${CONV}" -a kagent 2>/dev/null
+```
+
+**Verified on 2026-11-02:**
+
+```text
+TASK_STATE_COMPLETED	01a19ea9-2902-729f-a03a-026abadb1269	OK.
+suspended (polled 0s after the reply)
+ATESPACE   NAME                                           TEMPLATE                        STATE                   WORKER POD   WORKER IPS   VERSION   AGE
+kagent     session-01a19ea9-2902-729f-a03a-026abadb1269   kagent/assistant-ef2afecb25fc   ACTOR_STATE_SUSPENDED   <none>                    5         0s
+```
+
+The actor was suspended as soon as the turn ended. **There is no idle timeout to configure.** kagent
+suspends a session's actor when its last turn finishes, so idle lasts about a second. A turn
+that ends waiting for input (approval, authentication) pauses the actor on its worker instead of
+suspending it.
+
+Send the second turn in the same session:
+
+```bash run id=step-9-turn-2
+kagent_send assistant "What is my project called?" "$CONV"
+wait_suspended "$CONV"
+actor_events "$CONV"
+```
+
+**Verified on 2026-11-02:**
+
+```text
+TASK_STATE_COMPLETED	01a19ea9-2902-729f-a03a-026abadb1269	Your project is called **Larkspur**.
+suspended (polled 1s after the reply)
+23:47:28.800	Restore timing breakdown	latest/volumes	63 ms
+23:47:29.377	Checkpoint timing breakdown	latest/volumes	36 ms
+23:47:29.800	Restore timing breakdown	local/volumes	66 ms
+23:47:30.426	Checkpoint timing breakdown	latest/volumes	37 ms
+```
+
+The agent remembered, and atelet's log shows how:
+
+| Event | Snapshot | What it means |
+|---|---|---|
+| First restore | `latest/volumes` | The new actor started, with the volumes of the agent's golden snapshot (Step 8) |
+| Checkpoint | `latest/volumes` | At the end of the turn, the session's volumes were saved |
+| Second restore | `local/volumes` | The session's volumes as the last turn left them, from the copy kept on this node |
+| Checkpoint | `latest/volumes` | Saved again, replacing the previous one |
+
+Every snapshot is `volumes`: the runtime keeps the session in a database on its volume (Step 12),
+so that is all a resume needs. Whatever the runtime held only in memory when it suspended is not
+kept, and each resume boots the runtime image again, in about 65 ms here. `local` means atelet
+had the snapshot on the node already and did not fetch it from the store; Step 11 shows which node
+that is.
+
+A suspended session can resume on a different worker from the one it last ran on, because
+everything it needs is in the snapshot store.
 
 ### Step 10: Trace a turn
 
-*Not yet written.*
+Nothing has been recording traces so far: `kagent install` leaves telemetry off. Turn it on, with a
+trace store to send it to. Jaeger, in a single pod, is the smallest one that shows a whole turn:
+
+```bash run id=jaeger
+kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f-
+kubectl apply -f- <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: jaeger}
+  template:
+    metadata:
+      labels: {app: jaeger}
+    spec:
+      containers:
+        - name: jaeger
+          image: ${JAEGER_IMAGE}
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: query, containerPort: 16686}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: observability
+spec:
+  selector: {app: jaeger}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    - {name: query, port: 16686, targetPort: 16686}
+EOF
+kubectl rollout status deployment/jaeger -n observability --timeout=180s
+```
+
+Point kagent at it. Two settings: `config.telemetry` for the controller, and
+`config.runtimeDefaults.telemetry` for every agent runtime. `--reuse-values` keeps everything
+`kagent install` set. Both URLs are full DNS names, because the runtime's sandbox can only resolve
+names its egress policy allows:
+
+```bash run id=helm-kagent-telemetry
+OLD_REVISION=$(kubectl get agent assistant -n kagent -o jsonpath='{.status.latestSuccessfulRevision}')
+helm upgrade kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent --version ${KAGENT_VERSION} \
+  --namespace kagent --reuse-values --wait -f- >/dev/null <<EOF
+config:
+  telemetry:
+    traces:
+      endpoint: http://jaeger.observability.svc.cluster.local:4317
+      protocol: grpc
+  runtimeDefaults:
+    telemetry:
+      traces:
+        endpoint: http://jaeger.observability.svc.cluster.local:4317
+        protocol: grpc
+EOF
+helm history kagent -n kagent -o json | jq -r '.[-1] | "revision \(.revision): \(.status)"'
+```
+
+**Verified on 2026-11-02:**
+
+```text
+Pulled: ghcr.io/kagent-dev/kagent/helm/kagent:1.0.0-rc1
+Digest: sha256:372385ceb67ea2281645ca3755c27861f8b5dc0b60c8149995e658d46f5737e8
+revision 2: deployed
+```
+
+A change to the runtime's configuration is a new revision of every agent: kagent builds a new
+actor template and golden snapshot for it. **The Agent stays `Ready` while it does**, because the
+previous revision still serves, and a turn sent before the new one is ready runs on the old one,
+untraced. Wait for the new revision rather than for `Ready`:
+
+```bash run id=step-10-wait-revision
+for i in $(seq 1 60); do
+  NEW_REVISION=$(kubectl get agent assistant -n kagent -o jsonpath='{.status.latestSuccessfulRevision}')
+  [ -n "$NEW_REVISION" ] && [ "$NEW_REVISION" != "$OLD_REVISION" ] && break
+  sleep 5
+done
+echo "revision ${OLD_REVISION:0:12} -> ${NEW_REVISION:0:12}"
+kubectl-ate get actor-template -a kagent 2>/dev/null
+```
+
+**Verified on 2026-11-02:**
+
+```text
+revision ef2afecb25fc -> b355498dd959
+ATESPACE   NAME                     GOLDEN TAG                             ERROR   AGE
+kagent     assistant-b355498dd959   ed029698-1271-406b-a939-5a30678c6e58           14s
+kagent     assistant-ef2afecb25fc   417f09ac-0323-41cc-b065-be336531f7b3           74s
+```
+
+Two templates now: the new revision's, and the old one, which stays while sessions made from it
+(Steps 7 and 9) exist. Those sessions keep running untraced on the old revision. New sessions start
+from the new one.
+
+The gateway traces too. Send its spans to the same place:
+
+```bash run id=policy-agentgateway-tracing
+kubectl apply -f- <<EOF
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: agentgateway-proxy-tracing
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: agentgateway-proxy
+  frontend:
+    tracing:
+      backendRef:
+        kind: Service
+        name: jaeger
+        namespace: observability
+        port: 4317
+      protocol: GRPC
+      randomSampling: "true"
+EOF
+kubectl wait agentgatewaypolicy/agentgateway-proxy-tracing -n agentgateway-system \
+  --for=jsonpath='{.status.ancestors[0].conditions[?(@.type=="Attached")].status}'=True --timeout=60s
+```
+
+`randomSampling: "true"` traces every request. The gateway joins the trace the agent's request
+carries in its `traceparent` header, which Substrate's egress gateway passes through.
+
+The controller restarted with the upgrade, so bring the forwards back, then send a turn in a new
+session:
+
+```bash run id=step-10-traced-turn
+forwards
+TURN=$(kagent_send assistant "Reply with exactly: traced")
+echo "$TURN"
+export TRACED_CONTEXT=$(echo "$TURN" | cut -f2)
+kubectl-ate get egress-policy "session-${TRACED_CONTEXT}" --atespace kagent -o json 2>/dev/null \
+  | jq -r '.rules[] | to_entries[0] | "\(.key)\t\(.value.hostnames[0]):\(.value.ports.numbers[0])"'
+```
+
+**Verified on 2026-11-02:**
+
+```text
+deployment "kagent-controller" successfully rolled out
+deployment "kagent-ui" successfully rolled out
+forwards up: controller 18083, ui 14000
+TASK_STATE_COMPLETED	01a19eaa-0d47-7b6f-82a4-29d4a6554170	traced
+http	agentgateway-proxy.agentgateway-system.svc.cluster.local:80
+http	jaeger.observability.svc.cluster.local:4317
+http	kagent-controller.kagent.svc.cluster.local:8083
+https	api.anthropic.com:443
+```
+
+The session's egress policy now has a rule for the trace store: kagent added it, because the runtime
+is configured to send there.
+
+Read the turn's trace from Jaeger's API. The forward is opened for this block and closed at its end:
+
+```bash run id=step-10-read-trace
+kubectl --context "kind-${KIND_CLUSTER_NAME}" port-forward --address 127.0.0.1 -n observability service/jaeger ${JAEGER_PORT}:16686 >/dev/null 2>&1 &
+JAEGER_PF=$!
+sleep 10
+TRACE=$(curl -sS "http://127.0.0.1:${JAEGER_PORT}/api/traces?service=assistant&limit=1&lookback=15m")
+echo "$TRACE" | jq -r '.data[0] as $t | "trace \($t.traceID): \($t.spans | length) spans",
+  ($t.spans | sort_by(.startTime) | .[]
+    | select(.operationName | test("^(POST /agents|invoke_agent|generate_content|POST /v1/messages|POST api.anthropic)"))
+    | "\($t.processes[.processID].serviceName)\t\(.operationName)\t\(.duration / 1000 | floor) ms")'
+echo "-- the gateway's span:"
+echo "$TRACE" | jq -r '.data[0] as $t | $t.spans[]
+  | select($t.processes[.processID].serviceName == "agentgateway-proxy" and (.operationName | startswith("POST /v1/messages")))
+  | .tags[] | select(.key | test("^(route|http.response.status_code|gen_ai.request.model|gen_ai.usage.input_tokens|gen_ai.usage.output_tokens)$"))
+  | "\(.key)=\(.value)"'
+kill $JAEGER_PF; wait $JAEGER_PF 2>/dev/null || true
+```
+
+**Verified on 2026-11-02:**
+
+```text
+trace 26be57d046b9ac34216584c623c677b2: 26 spans
+kagent-controller	POST /agents/	866 ms
+assistant	invoke_agent assistant	518 ms
+assistant	generate_content claude-haiku-4-5	516 ms
+agentgateway-proxy	POST /v1/messages/*	507 ms
+agentgateway-proxy	POST api.anthropic.com:443	478 ms
+-- the gateway's span:
+gen_ai.request.model=claude-haiku-4-5
+gen_ai.usage.input_tokens=1847
+gen_ai.usage.output_tokens=4
+http.response.status_code=200
+route=agentgateway-system/anthropic-messages
+```
+
+One trace, three services. `kagent-controller` received the A2A request, the agent runtime
+(service `assistant`, the agent's name) ran it and called the model, and `agentgateway-proxy`
+handled that call and made its own to Anthropic. The gateway's span carries the same route and
+token counts as its log in Step 7. Open `http://127.0.0.1:${JAEGER_PORT}` with the same
+port-forward to browse it in Jaeger's UI.
+
+Traces do not hold the conversation: no span here contains the prompt or the reply. The runtime
+records content only when `capture_content` is set in its telemetry configuration, and the guide
+leaves it off.
+
+> [!NOTE]
+> **This Jaeger is for looking, not keeping.** It stores traces in memory, in one pod, and its API and UI have no sign-in: anyone who can reach the Service can read every trace. Use a trace backend with storage and access control for anything beyond this guide.
 
 ### Step 11: Inspect and act on an actor
 
-*Not yet written.*
+kagent drives actors for you. kubectl-ate lets you look at one and act on it directly, which is
+what you need when a session is stuck:
+
+```bash run id=step-11-inspect
+kubectl-ate get actor "session-${CONV}" -a kagent -o json 2>/dev/null \
+  | jq '{name: .metadata.name, uid: .metadata.uid, version: .metadata.version, state: .status.state, snapshot: (.status.snapshots[-1] | {uri: .durableSnapshot.object.snapshotUri, state: .durableSnapshot.state, fidelity, locality})}'
+```
+
+**Verified on 2026-11-02:**
+
+```text
+{
+  "name": "session-01a19ea9-2902-729f-a03a-026abadb1269",
+  "uid": "0d762116-837e-4efb-9000-221ddf8c7f5e",
+  "version": "9",
+  "state": "ACTOR_STATE_SUSPENDED",
+  "snapshot": {
+    "uri": "gs://ate-snapshots/kagent/atespaces/kagent/actors/0d762116-837e-4efb-9000-221ddf8c7f5e/snapshots/d37d76ad-91a3-43bb-8423-beb92c6ae860",
+    "state": "SNAPSHOT_STORAGE_STATE_COMPLETED",
+    "fidelity": "SNAPSHOT_FIDELITY_VOLUMES",
+    "locality": "agents-control-plane"
+  }
+}
+```
+
+`version` counts state changes: every turn moves it through resuming, running, suspending and
+suspended. `snapshot` is its latest checkpoint: where it is in the store, whether the upload has
+finished, its fidelity (Step 8), and the node that also keeps a copy (`locality`).
+
+Resume it by hand, see it placed on a worker, then suspend it again:
+
+```bash run id=step-11-resume-suspend
+kubectl-ate resume actor "session-${CONV}" -a kagent 2>/dev/null
+kubectl-ate get workers 2>/dev/null
+kubectl-ate suspend actor "session-${CONV}" -a kagent --mode sync 2>/dev/null
+```
+
+**Verified on 2026-11-02:**
+
+```text
+ATESPACE   NAME                                           TEMPLATE                        STATE                 WORKER POD                               WORKER IPS    VERSION   AGE
+kagent     session-01a19ea9-2902-729f-a03a-026abadb1269   kagent/assistant-ef2afecb25fc   ACTOR_STATE_RUNNING   kagent/kagent-default-5ffdf9d9f7-pwpbq   10.244.0.25   11        69s
+NAME                                   POOL             STATE                 ACTORS   CPU(MILLICORES)   MEMORY           POD                                      AGE
+814d9ff9-7252-4614-ba17-65c793f79966   kagent-default   WORKER_STATE_ACTIVE   1/1000   1000/6000         1Gi/12154772Ki   kagent/kagent-default-5ffdf9d9f7-pwpbq   2m30s
+ATESPACE   NAME                                           TEMPLATE                        STATE                   WORKER POD   WORKER IPS   VERSION   AGE
+kagent     session-01a19ea9-2902-729f-a03a-026abadb1269   kagent/assistant-ef2afecb25fc   ACTOR_STATE_SUSPENDED   <none>                    13        69s
+```
+
+While it runs, the actor holds 1000 millicores and 1 GiB of its worker's capacity: the limits every
+agent runtime gets from the chart's `config.runtimeDefaults`, which Scale comes back to.
+`--mode sync` waits until the snapshot is uploaded before returning. Without it, kubectl-ate
+returns once the actor stops and the upload finishes in the background.
+
+> [!WARNING]
+> **A hand-resumed actor stays running until a turn ends or you suspend it.** kagent suspends an actor when a turn finishes, and a resume with no turn never finishes one, so the actor holds its place on a worker indefinitely. Suspend what you resume.
 
 ### Step 12: Where a session's context is kept
 
-*Not yet written.*
+The session survived suspension because atelet wrote it to the snapshot store. With Substrate's
+bundled store, that is the RustFS bucket `ate-snapshots`, under the prefix the Harness's
+`snapshotPolicy.location` named (`kagent/`).
+
+Substrate's chart denies all ingress in `ate-system` by default and admits only atelet, ate-api
+and its bucket-init Job to the store. To look inside it, admit one more pod, labelled
+`app: snapshot-ls`, to the S3 port. Step 21 removes this exception again:
+
+```bash run id=networkpolicy-rustfs-inspect
+kubectl apply -f- <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rustfs-snapshot-inspect
+  namespace: ate-system
+spec:
+  podSelector:
+    matchLabels:
+      app: rustfs
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: snapshot-ls
+      ports:
+        - protocol: TCP
+          port: 9000
+EOF
+```
+
+This helper lists a prefix in that bucket from that short-lived pod. It reads the store's
+credentials from the atelet DaemonSet's `objectstore-plugin` init container, which is where the
+chart puts them:
+
+```bash run id=step-12-helpers
+# snapshot_ls <prefix>: list objects under s3://ate-snapshots/<prefix>.
+# Uses the store's credentials from the atelet DaemonSet, unless S3_ACCESS_KEY and S3_SECRET_KEY are set.
+snapshot_ls() {
+  local ak sk
+  ak=${S3_ACCESS_KEY:-$(kubectl get daemonset atelet -n ate-system -o json | jq -r '[(.spec.template.spec.containers + (.spec.template.spec.initContainers // []))[].env[]? | select(.name=="AWS_ACCESS_KEY_ID")][0].value')}
+  sk=${S3_SECRET_KEY:-$(kubectl get daemonset atelet -n ate-system -o json | jq -r '[(.spec.template.spec.containers + (.spec.template.spec.initContainers // []))[].env[]? | select(.name=="AWS_SECRET_ACCESS_KEY")][0].value')}
+  kubectl delete pod snapshot-ls -n ate-system --ignore-not-found >/dev/null
+  kubectl create -f- >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: snapshot-ls
+  namespace: ate-system
+  labels: {app: snapshot-ls}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: aws
+      image: ${AWS_CLI_IMAGE}
+      args: ["s3", "ls", "--recursive", "s3://ate-snapshots/$1", "--endpoint-url", "http://rustfs.ate-system.svc:9000",
+             "--cli-connect-timeout", "10", "--cli-read-timeout", "10"]
+      env:
+        - {name: AWS_ACCESS_KEY_ID, value: "${ak}"}
+        - {name: AWS_SECRET_ACCESS_KEY, value: "${sk}"}
+        - {name: AWS_DEFAULT_REGION, value: us-east-1}
+EOF
+  local phase="" waited=0 out
+  while [ "$waited" -lt 120 ]; do
+    phase=$(kubectl get pod snapshot-ls -n ate-system -o jsonpath='{.status.phase}')
+    case "$phase" in Succeeded|Failed) break ;; esac
+    sleep 1; waited=$((waited + 1))
+  done
+  out=$(kubectl logs pod/snapshot-ls -n ate-system)
+  if [ -n "$out" ]; then echo "$out"; else echo "(no objects)"; fi
+  kubectl delete pod snapshot-ls -n ate-system --wait=false >/dev/null
+}
+```
+
+`aws s3 ls` exits 1 when a prefix holds nothing, so the pod ends `Failed` for an empty prefix. The
+helper waits for the pod to finish either way and prints `(no objects)` rather than reading the
+phase as an answer.
+
+List this session's snapshot, and the agent's golden images:
+
+```bash run id=step-12-snapshot-objects
+export CONV_ACTOR_UID=$(kubectl-ate get actor "session-${CONV}" -a kagent -o json 2>/dev/null | jq -r .metadata.uid)
+echo "-- session ${CONV} (actor ${CONV_ACTOR_UID})"
+snapshot_ls "kagent/atespaces/kagent/actors/${CONV_ACTOR_UID}/"
+echo "-- golden images"
+snapshot_ls "kagent/atespaces/kagent/tags/"
+```
+
+**Verified on 2026-11-02:**
+
+```text
+-- session 01a19ea9-2902-729f-a03a-026abadb1269 (actor 0d762116-837e-4efb-9000-221ddf8c7f5e)
+2026-11-02 23:48:38        105 kagent/atespaces/kagent/actors/0d762116-837e-4efb-9000-221ddf8c7f5e/snapshots/24b2a8cf-df65-4fba-b433-0f5402ca3557/fs/fscheckpoint.pb.zstd
+2026-11-02 23:48:38        183 kagent/atespaces/kagent/actors/0d762116-837e-4efb-9000-221ddf8c7f5e/snapshots/24b2a8cf-df65-4fba-b433-0f5402ca3557/fs/multitar.img.zstd
+2026-11-02 23:48:38       1511 kagent/atespaces/kagent/actors/0d762116-837e-4efb-9000-221ddf8c7f5e/snapshots/24b2a8cf-df65-4fba-b433-0f5402ca3557/fs/pages.img.zstd
+2026-11-02 23:48:38        113 kagent/atespaces/kagent/actors/0d762116-837e-4efb-9000-221ddf8c7f5e/snapshots/24b2a8cf-df65-4fba-b433-0f5402ca3557/fs/pages_meta.img.zstd
+2026-11-02 23:48:38        611 kagent/atespaces/kagent/actors/0d762116-837e-4efb-9000-221ddf8c7f5e/snapshots/24b2a8cf-df65-4fba-b433-0f5402ca3557/manifest.json
+-- golden images
+2026-11-02 23:47:24        105 kagent/atespaces/kagent/tags/59ca8c00-3196-4fdf-a4c8-7a1aed1f4fe6/fs/fscheckpoint.pb.zstd
+2026-11-02 23:47:24        183 kagent/atespaces/kagent/tags/59ca8c00-3196-4fdf-a4c8-7a1aed1f4fe6/fs/multitar.img.zstd
+2026-11-02 23:47:24        793 kagent/atespaces/kagent/tags/59ca8c00-3196-4fdf-a4c8-7a1aed1f4fe6/fs/pages.img.zstd
+2026-11-02 23:47:24        113 kagent/atespaces/kagent/tags/59ca8c00-3196-4fdf-a4c8-7a1aed1f4fe6/fs/pages_meta.img.zstd
+2026-11-02 23:47:24        603 kagent/atespaces/kagent/tags/59ca8c00-3196-4fdf-a4c8-7a1aed1f4fe6/manifest.json
+2026-11-02 23:48:19        105 kagent/atespaces/kagent/tags/a3244842-7a96-4446-ad11-0ef2979bb03a/fs/fscheckpoint.pb.zstd
+2026-11-02 23:48:19        182 kagent/atespaces/kagent/tags/a3244842-7a96-4446-ad11-0ef2979bb03a/fs/multitar.img.zstd
+2026-11-02 23:48:19        793 kagent/atespaces/kagent/tags/a3244842-7a96-4446-ad11-0ef2979bb03a/fs/pages.img.zstd
+2026-11-02 23:48:19        113 kagent/atespaces/kagent/tags/a3244842-7a96-4446-ad11-0ef2979bb03a/fs/pages_meta.img.zstd
+2026-11-02 23:48:19        603 kagent/atespaces/kagent/tags/a3244842-7a96-4446-ad11-0ef2979bb03a/manifest.json
+```
+
+Each session keeps one snapshot, which each checkpoint replaces: its volumes, under `fs/`, and a
+manifest. The volumes hold the runtime's database, the session's text included. That **is the
+session, in readable text**: compressed with zstd, not encrypted. A golden image has the same
+shape and holds the agent's volumes at start-up, shared by every session with that agent; there is
+one per revision (Step 10), and neither kind holds process memory (Step 8). kagent's tables in
+PostgreSQL hold a second copy of each session's events.
+
+> [!WARNING]
+> **Anyone who can read the atelet DaemonSet has the store's credentials, and with them any pod the store admits can read every session.** The helper above works for exactly that reason, through the exception you just added. Step 21 replaces the credentials and removes the exception. Until then, treat every session on this cluster as readable by anyone who can read `ate-system`.
 
 ### Step 13: Delete a session, and what stays behind
 
-*Not yet written.*
+The kagent CLI from Step 3 manages sessions through the same API the UI uses. Point it at the
+controller's port-forward. With no sign-in yet (Step 7), it acts as `admin@kagent.dev`, the user
+every request so far has been treated as, so it sees the sessions this guide started:
+
+```bash run id=step-13-list
+kagent --api-url "http://127.0.0.1:${KAGENT_API_PORT}" agent session list
+```
+
+**Verified on 2026-11-02:**
+
+```text
++--------------------------------------+------------------+-------+----------------------+
+| ID                                   | AGENT            | STATE | CREATED              |
++--------------------------------------+------------------+-------+----------------------+
+| 01a19ea9-2405-73cc-94e0-8151075388c8 | kagent/assistant | READY | 2026-11-02T23:47:27Z |
+| 01a19ea9-2902-729f-a03a-026abadb1269 | kagent/assistant | READY | 2026-11-02T23:47:28Z |
+| 01a19eaa-0d47-7b6f-82a4-29d4a6554170 | kagent/assistant | READY | 2026-11-02T23:48:27Z |
++--------------------------------------+------------------+-------+----------------------+
+```
+
+Delete the session from Step 9:
+
+```bash run id=step-13-delete
+kagent --api-url "http://127.0.0.1:${KAGENT_API_PORT}" agent session delete "$CONV"
+```
+
+**Verified on 2026-11-02:**
+
+```text
++--------------------------------------+------------------+---------+----------------------+
+| ID                                   | AGENT            | STATE   | CREATED              |
++--------------------------------------+------------------+---------+----------------------+
+| 01a19ea9-2902-729f-a03a-026abadb1269 | kagent/assistant | DELETED | 2026-11-02T23:47:28Z |
++--------------------------------------+------------------+---------+----------------------+
+```
+
+Then check the actor, the snapshot and the worker node:
+
+```bash run id=step-13-check
+kubectl-ate get actor "session-${CONV}" -a kagent 2>&1 | grep -v 'no --token-file' || true
+echo "-- snapshot objects left for the actor:"
+snapshot_ls "kagent/atespaces/kagent/actors/${CONV_ACTOR_UID}/"
+echo "-- directory left on the node:"
+docker exec "${KIND_CLUSTER_NAME}-control-plane" sh -c "ls /var/lib/ate/actors/${CONV_ACTOR_UID} 2>/dev/null || echo '(none)'"
+```
+
+**Verified on 2026-11-02:**
+
+```text
+Error: failed to get actor "session-01a19ea9-2902-729f-a03a-026abadb1269": rpc error: code = NotFound desc = Actor kagent/session-01a19ea9-2902-729f-a03a-026abadb1269 not found
+-- snapshot objects left for the actor:
+(no objects)
+-- directory left on the node:
+(none)
+```
+
+The actor is gone from Substrate, its snapshot from the store, and its working directory from
+the node.
+
+Deleting an `Agent` does not delete its sessions. Its actor template and golden image stay
+in Substrate for as long as any of its sessions exist. Delete an agent's sessions as well as
+the `Agent` when you retire it.
 
 ### Step 14: Choose a Harness
 
-*Not yet written.*
+An `Agent` pairs a template with a harness, and the two are independent. The `assistant` template
+says what the agent is; the harness says what runs it. This runs the same template on the Claude
+Code runtime instead of kagent's Go ADK runtime, with no change to the template, the model
+configuration or the gateway:
+
+```bash run id=harness-claude-code
+kubectl apply -f- <<EOF
+apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata:
+  name: claude-code
+  namespace: kagent
+spec:
+  claude: {}
+  workload:
+    image: ${CLAUDE_HARNESS_IMAGE}
+  substrate:
+    workerPoolRef:
+      name: kagent-default
+    snapshotPolicy:
+      location: gs://ate-snapshots/kagent/
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: assistant-claude-code
+  namespace: kagent
+spec:
+  template:
+    ref:
+      name: assistant
+  harnessRef:
+    name: claude-code
+EOF
+kubectl wait agent/assistant-claude-code -n kagent --for=condition=Ready --timeout=300s
+```
+
+**Verified on 2026-11-02:**
+
+```text
+harness.api.kagent.dev/claude-code created
+agent.api.kagent.dev/assistant-claude-code created
+agent.api.kagent.dev/assistant-claude-code condition met
+```
+
+```bash run id=step-14-claude-code-turn
+TURN=$(kagent_send assistant-claude-code "Reply with exactly: claude code harness")
+echo "$TURN"
+export CLAUDE_CONTEXT=$(echo "$TURN" | cut -f2)
+kubectl-ate get egress-policy "session-${CLAUDE_CONTEXT}" --atespace kagent -o json 2>/dev/null \
+  | jq -r '.rules[] | to_entries[0] | "\(.key)\t\(.value.hostnames[0]):\(.value.ports.numbers[0])\t\([.value.effects.replaceHeaders[]? | "\(.header) <- \(.credentialUri // "actor JWT, audience \(.actorJwt.audiences | join(",")), \(.actorJwt.expirationSeconds)s")"] | join(", "))"'
+```
+
+**Verified on 2026-11-02:**
+
+```text
+TASK_STATE_COMPLETED	01a19eaa-b7fb-7da6-aae6-29afce92d730	claude code harness
+http	agentgateway-proxy.agentgateway-system.svc.cluster.local:80	x-api-key <- ate-secret://k8s.io/default/kagent/kagent-anthropic/ANTHROPIC_API_KEY
+http	jaeger.observability.svc.cluster.local:4317	
+http	kagent-controller.kagent.svc.cluster.local:8083	authorization <- actor JWT, audience kagent-runtime, 300s
+```
+
+Same consumer key, same injection, same gateway. The runtime changed and nothing around it did.
+
+One difference from Step 7: this actor's allowlist has no `api.anthropic.com` rule. The kagent
+runtime's actors get one whatever `baseUrl` says; the Claude Code runtime's do not, so its actors
+can reach the provider only through the gateway. It does have the trace store's rule, because
+Step 10's telemetry applies to every runtime.
+
+Four harness kinds exist on this release, and an Agent's harness names exactly one:
+
+| Kind | What runs | In this guide |
+|---|---|---|
+| `kagent` | kagent's Go ADK runtime | Steps 6 to 13 |
+| `claude` | Claude Code | This step |
+| `codex` | OpenAI Codex | Not covered: not verified on this release |
+| `byo` | Your own image | Not covered: see below |
+
+Every harness in this guide names its image in `workload.image`, pinned by digest. Only `byo` must:
+for `claude` and `codex`, `workload` is optional, and the controller fills in the image from the
+chart's `config.harnessImages`, which on this release ships the same Claude Code digest pinned
+here. The guide names it anyway, so the image a session runs is in the Harness you read.
+
+`byo` is the path for other frameworks, such as LangGraph or CrewAI, and it is not a plain
+container: the image must implement kagent's agent contract, which kagent's adapter packages for
+those frameworks provide. An unmodified framework image does not run.
+
+**What you now have:** the lifecycle of a session, end to end, and the commands to see each
+stage: the template and golden image behind an agent, an actor per session that holds nothing
+on a worker while suspended, one trace per turn across kagent, the runtime and the gateway,
+context in the snapshot store, and what deletion leaves behind. You have also seen how exposed
+that context is. Isolate starts there.
 
 ## ISOLATE
 
