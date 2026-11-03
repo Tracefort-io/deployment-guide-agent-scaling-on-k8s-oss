@@ -3673,4 +3673,131 @@ What it does not do yet is in Before production.
 
 ## Before production
 
-*Not yet written.*
+This guide shows what the open-source stack can do, on one kind node, installed the quick way. Each
+item below is a limit of this install or of this release that you can plan for, with the step that
+shows it. For a production install built piece by piece, with its PostgreSQL, certificates and
+upgrades worked through, see the companion guide for Solo Enterprise for kagent.
+
+**The install**
+
+- **Treat `kagent install` as a starting point.** It is built for getting started (Step 3).
+  `kagent install --dry-run --output-dir <dir>` writes the same install out as Helm commands and
+  values files, which you can review, change and keep in version control. Make later changes with
+  `helm upgrade --reuse-values`, as Steps 10, 22 and 28 do, rather than by running the install again.
+- **Run PostgreSQL as a production database.** The one `kagent install` creates is a single pod
+  with a 500Mi volume, no replica, no backup and no pgvector extension, and it holds every
+  session's events and Substrate's actor records (Steps 3 and 26). kagent and Substrate log in to
+  it with workload certificates, not passwords: check that a managed PostgreSQL accepts
+  client-certificate logins before choosing one. None was tested here.
+- **Size the snapshot store, and bound atelet's caches, at install.** The store is 1Gi, and a
+  suspended session takes about 56 KiB of it and more in PostgreSQL (Step 26). atelet's snapshot
+  and sandbox asset caches on each node have no size limit, and it logs a warning saying so. Both
+  are Substrate chart values, which `kagent install` takes from a values file named in its config,
+  as Step 3 does for kagent's:
+
+  ```yaml
+  install:
+    substrate:
+      valuesFiles:
+        - substrate-values.yaml
+  ```
+
+  with `substrate-values.yaml` holding, for example:
+
+  ```yaml
+  rustfs:
+    storageSize: 20Gi
+  atelet:
+    extraArgs:
+      - --snapshot-cache-max-bytes=2147483648
+      - --sandbox-asset-cache-max-bytes=2147483648
+  ```
+
+  `--dry-run` shows both values reaching the Substrate release; an install with them was not run
+  here. Changing the store's size later needs a storage class that supports volume expansion.
+- **Rotate the certificate authorities before they expire.** `kagent install` creates Substrate's
+  CA pools, for workload identity, PostgreSQL logins, service names and Substrate's egress, valid for
+  one year, and nothing rotates them. When they expire, nothing issued from them validates. Plan the
+  rotation; it was not tested with this install.
+
+**Sessions and their data**
+
+- **Treat the snapshot store as holding every session in readable form.** Each snapshot is the
+  session's volumes, its database included, compressed, not encrypted (Steps 12 and 16). Keep the
+  NetworkPolicy and the new credentials from Step 21, keep the credentials out of anything you
+  commit, and if you use an external object store, turn on the bucket's default encryption.
+- **Keep traces somewhere you control.** Every MCP tool call's arguments and response are stored in
+  its trace (Step 19). The Jaeger in this guide keeps traces in memory, loses them when it
+  restarts, and answers anyone who can reach it (Step 10). Run a trace store with storage, a
+  retention period and access control, and fence it as you fenced the snapshot store.
+- **Delete an agent's sessions when you retire it.** Deleting the `Agent` leaves its actor template
+  and golden snapshot in Substrate while any of its sessions exists (Step 13).
+
+**Sign-in and access**
+
+- **Keep the controller fenced.** In `trusted-proxy` mode the controller takes the user from the
+  token without checking its signature, so anything that can reach it can act as any user (Step 23).
+  Keep the NetworkPolicies from Step 23, and keep the right to port-forward to pods in the `kagent`
+  namespace (`pods/portforward`) to administrators: a port-forward passes no NetworkPolicy, so it is
+  the right to act as any user.
+- **Restrict who can create pods in the `kagent` namespace.** The gateway's NetworkPolicy admits
+  kagent's pods by label, so a pod created there with the controller's labels reaches the gateway
+  (Step 5). The kagent release's values and the `kagent-anthropic` Secret hold the consumer key
+  (Step 3).
+- **Decide who gets an account.** Open-source kagent has no roles: every signed-in user can see and
+  change every agent, though not another user's sessions (Step 23). Who can sign in is who can
+  administer agents.
+- **Run Keycloak, or your identity provider, for production.** The Keycloak in this guide runs in
+  development mode, over HTTP, with its database inside the pod: it re-imports the realm from its
+  Secret whenever the pod restarts, and anything changed after the import is lost (Step 22).
+- **Disable the `kagent-cli` client once scripting is done.** It issues tokens by password, without
+  a browser, for scripts. Disable it with the block below, and give production scripts a
+  confidential client with the client credentials grant. With this guide's Keycloak, remove the
+  client from the realm in the `keycloak-realm` Secret too, or it comes back the next time the pod
+  restarts.
+
+```bash run id=keycloak-disable-kagent-cli when=manual
+KC="http://keycloak.localhost:${KEYCLOAK_PORT}"
+ADMIN_TOKEN=$(curl -sS -X POST "${KC}/realms/master/protocol/openid-connect/token" -d grant_type=password \
+  -d client_id=admin-cli -d username=admin --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}" | jq -r .access_token)
+CLI_ID=$(curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${KC}/admin/realms/kagent/clients?clientId=kagent-cli" | jq -r '.[0].id')
+curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${KC}/admin/realms/kagent/clients/${CLI_ID}" | jq '.enabled = false' \
+  | curl -sS -o /dev/null -w 'disable kagent-cli: HTTP %{http_code}\n' -X PUT -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+      -H 'Content-Type: application/json' --data-binary @- "${KC}/admin/realms/kagent/clients/${CLI_ID}"
+```
+
+**Model traffic and spend**
+
+- **Expect the kagent runtime to be able to reach the model provider directly.** Its egress policy
+  includes `api.anthropic.com`, so the allowlist alone does not force its model traffic through the
+  gateway; the actor holds no key to use there (Step 18). The Claude Code runtime cannot reach it.
+- **Keep the hop from Substrate's egress to agentgateway inside the cluster.** It is plain HTTP, to
+  the base URL Step 3 set.
+- **Cap and attribute per key, per gateway replica.** The token cap counts per consumer key's group,
+  not per person in the session, in windows of at most an hour, and each gateway replica keeps its
+  own count, so the cluster-wide cap is the cap times the replicas (Step 20). Issue keys per team or
+  per agent.
+- **Watch for turns held open by the cap.** A turn over the cap neither fails nor finishes: the
+  kagent runtime waits out the gateway's `Retry-After`, up to an hour, its actor keeps running and
+  holds a worker slot, and its session takes no other message until the turn is cancelled (Steps 20
+  and 27).
+
+**Capacity**
+
+- **Give workers resource requests, one worker per node.** `kagent install` sets none, so nothing
+  reserves node capacity for running actors, and two workers on one node admit more turns than its
+  CPUs can serve (Step 27).
+- **Have callers retry when the pool is full.** A turn that finds no free slot is held for about 5
+  seconds and then refused with `input was not accepted; retry after the session becomes
+  available` (Step 27).
+- **Keep CPU headroom for worker rollouts.** A worker pool rollout removes a worker before starting
+  its replacement; add a worker before changing worker resources (Step 28).
+- **Use gVisor.** It is the sandbox verified here, on one node; Firecracker and multi-node
+  clusters were not tested.
+
+When you are done with this cluster, or before working on another, close its port-forwards. This
+frees ports 18080, 18083 and 14000 and leaves forwards to other clusters alone:
+
+```bash run id=stop-forwards when=manual
+stop_forwards
+```
