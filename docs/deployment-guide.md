@@ -3427,17 +3427,249 @@ gap in service.
 
 ## VALIDATE
 
+Everything above was proved one control at a time. This section sends one session through all of
+them and checks each result against the step that set it up. If something breaks later, this is the
+section to run first.
+
+**What you are going to do:** sign in as alice, run one session that calls a model and an MCP tool,
+then check the session from every side: its sandbox, its credentials, its egress, the gateway, the
+MCP server, the fences, and another user's access.
+
+**What you will have that you did not have before:** one pass that tells you whether the whole
+platform still does what each step said it would, and which step to go back to when it does not.
+
+**Verified on:** the kind cluster from the Scale run, 2026-11-03 07:06 UTC: the blocks of this section executed verbatim with `auto-build/run.sh --from step-29-helpers`, which runs the helper blocks before it and reads back from the cluster the values a reader's shell would still hold. Validate passed 19 of 19. Every output block in Validate comes from that run.
+
 ### Step 29: Drive one session through every control
 
-*Not yet written.*
+*Runtime: kagent (agent `deployment-helper`, which calls the model and the MCP tool). One model call.*
+
+`record` prints one check: the step that set the control up, what was checked, what was observed,
+and whether that matches what the step said. It also keeps the line for Step 30. `trace_spans`
+reads every span of a session's turns from Jaeger, through a port-forward it opens and closes:
+
+```bash run id=step-29-helpers
+# record <step> <what was checked> <observed> <expected: an extended regular expression>
+record() {
+  local result=FAIL
+  printf '%s' "$3" | grep -qE -- "$4" && result=PASS
+  VALIDATE_RESULTS="${VALIDATE_RESULTS:-}${result}|$1|$2|$3"$'\n'
+  printf '%-4s  %-13s  %s: %s\n' "$result" "$1" "$2" "$3"
+}
+
+# trace_spans <agent> <session id>: service and operation of every span in that session's traces.
+trace_spans() {
+  local pf tags
+  kubectl --context "kind-${KIND_CLUSTER_NAME}" port-forward --address 127.0.0.1 -n observability service/jaeger ${JAEGER_PORT}:16686 >/dev/null 2>&1 &
+  pf=$!; sleep 3
+  tags=$(jq -rn --arg c "$2" '{"gen_ai.conversation.id": $c} | tojson | @uri')
+  curl -sS "http://127.0.0.1:${JAEGER_PORT}/api/traces?service=$1&tags=${tags}&lookback=1h&limit=20" \
+    | jq -r '.data[] as $t | $t.spans[] | "\($t.processes[.processID].serviceName)\t\(.operationName)"'
+  kill $pf; wait $pf 2>/dev/null || true
+}
+```
+
+**Who is calling.** The forwards come up first, because anything that restarted the controller since
+you last used them has taken them down. Keycloak issues alice a token, and neither the UI nor the
+API answers without one:
+
+```bash run id=step-29-identity
+forwards >/dev/null
+VALIDATE_RESULTS=""
+record "Step 22" "Keycloak token for alice" "$(kagent_token alice >/dev/null && echo issued || echo none)" '^issued$'
+record "Step 22" "UI with no sign-in" "HTTP $(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${KAGENT_UI_PORT}/")" '^HTTP 403$'
+record "Step 22" "API call with no token" "HTTP $(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:${KAGENT_API_PORT}/agents/kagent/deployment-helper" -H 'Content-Type: application/json' -d '{}')" '^HTTP 401$'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+PASS  Step 22        Keycloak token for alice: issued
+PASS  Step 22        UI with no sign-in: HTTP 403
+PASS  Step 22        API call with no token: HTTP 401
+```
+
+**The session.** One turn, as alice, that needs both the model and the tool:
+
+```bash run id=step-29-session
+TURN=$(KAGENT_AS=alice kagent_send deployment-helper "What is the deployment code for the service billing? Use the tool.")
+export VALIDATE_CONV=$(echo "$TURN" | cut -f2)
+record "Steps 6, 19" "Turn using the model and the MCP tool" "$(echo "$TURN" | cut -f1,3 | tr '\t\n' '  ')" 'TASK_STATE_COMPLETED.*K7-teal-otter-0429'
+wait_suspended "$VALIDATE_CONV" >/dev/null
+record "Step 9" "First restore of the session's actor" "$(actor_events "$VALIDATE_CONV" | head -1 | cut -f2,3 | tr '\t' ' ')" '^Restore timing breakdown latest/volumes$'
+record "Step 9" "Actor state after the turn" "$(kubectl-ate get actor "session-${VALIDATE_CONV}" -a kagent -o json 2>/dev/null | jq -r .status.state)" '^ACTOR_STATE_SUSPENDED$'
+for i in $(seq 1 12); do
+  trace_spans deployment-helper "$VALIDATE_CONV" | awk -F'\t' '$1 == "agentgateway-proxy" && $2 ~ /^POST \/v1\/messages/ {f=1} END {exit !f}' && break
+  sleep 5
+done
+record "Step 10" "Spans in the session's trace" "$(trace_spans deployment-helper "$VALIDATE_CONV" | awk -F'\t' '
+  $2 ~ /^invoke_agent / {a++} $2 ~ /^generate_content / {g++} $2 ~ /^execute_tool / {x++}
+  $1 == "agentgateway-proxy" && $2 ~ /^POST \/v1\/messages/ {m++} $1 == "agentgateway-proxy" && $2 ~ /^tools\/call / {t++}
+  END {printf "invoke_agent=%d generate_content=%d execute_tool=%d gateway model=%d gateway tool=%d", a, g, x, m, t}')" \
+  '^invoke_agent=1 generate_content=[1-9][0-9]* execute_tool=1 gateway model=[1-9][0-9]* gateway tool=1$'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+PASS  Steps 6, 19    Turn using the model and the MCP tool: TASK_STATE_COMPLETED The deployment code for the service **billing** is **K7-teal-otter-0429**. 
+PASS  Step 9         First restore of the session's actor: Restore timing breakdown latest/volumes
+PASS  Step 9         Actor state after the turn: ACTOR_STATE_SUSPENDED
+PASS  Step 10        Spans in the session's trace: invoke_agent=1 generate_content=2 execute_tool=1 gateway model=2 gateway tool=1
+```
+
+**Inside the sandbox.** Resume the actor and look:
+
+```bash run id=step-29-sandbox
+kubectl-ate resume actor "session-${VALIDATE_CONV}" -a kagent >/dev/null 2>&1
+record "Step 15" "Kernel the agent sees" "$(sandbox_exec "$VALIDATE_CONV" uname -r)" 'gvisor'
+record "Step 17" "Model credential the agent holds" "$(sandbox_exec "$VALIDATE_CONV" cat /proc/1/environ | tr '\0' '\n' | grep '^ANTHROPIC_API_KEY=')" '^ANTHROPIC_API_KEY=kagent-credential-injected$'
+record "Step 17" "Consumer key in the sandbox's filesystem" "$(sandbox_exec "$VALIDATE_CONV" tar -cf - --exclude=./proc --exclude=./sys -C / . \
+  | LC_ALL=C grep -a -c -F "$AGENT_CONSUMER_KEY" || true) occurrences" '^0 occurrences$'
+record "Step 18" "A destination outside the egress policy" "$(sandbox_exec "$VALIDATE_CONV" wget -T 10 -O /dev/null https://example.com/ | grep -o -E 'HTTP/1.1 [0-9]+ [A-Za-z]+|bad address' | head -1)" '^bad address$'
+kubectl-ate suspend actor "session-${VALIDATE_CONV}" -a kagent >/dev/null 2>&1
+```
+
+**Verified on 2026-11-03:**
+
+```text
+PASS  Step 15        Kernel the agent sees: 4.19.0-gvisor
+PASS  Step 17        Model credential the agent holds: ANTHROPIC_API_KEY=kagent-credential-injected
+PASS  Step 17        Consumer key in the sandbox's filesystem: 0 occurrences
+PASS  Step 18        A destination outside the egress policy: bad address
+```
+
+**Where the calls went.** The gateway's record of the model call, its token metrics and cap, and
+the MCP server's record of the tool call:
+
+```bash run id=step-29-gateway
+EGRESS_IP=$(kubectl get pod -n ate-system -l app=atenet-egress -o jsonpath='{.items[0].status.podIP}')
+GATEWAY_IP=$(kubectl get pod -n agentgateway-system -l gateway.networking.k8s.io/gateway-name=agentgateway-proxy -o jsonpath='{.items[0].status.podIP}')
+record "Steps 2, 7" "Model call at the gateway, from Substrate egress" "$(kubectl logs -n agentgateway-system deployment/agentgateway-proxy --since=10m \
+  | grep 'route=agentgateway-system/anthropic-messages' | grep "src.addr=${EGRESS_IP}:" | tail -1 | grep -oE 'http.status=[0-9]+')" '^http.status=200$'
+record "Step 19" "Tool call at the MCP server: source, credential" "$(kubectl logs -n mcp-tools deployment/deployment-codes \
+  | jq -r 'select(.rpc == "tools/call") | "\(.src) \(.auth)"' | tail -1)" "^${GATEWAY_IP} bearer-match$"
+kubectl --context "kind-${KIND_CLUSTER_NAME}" port-forward --address 127.0.0.1 -n agentgateway-system deployment/agentgateway-proxy 18082:15020 >/dev/null 2>&1 &
+PF=$!; sleep 3
+if kill -0 $PF 2>/dev/null; then
+  ATTRIBUTED=$(curl -sS http://127.0.0.1:18082/metrics | grep '^agentgateway_gen_ai_client_token_usage_sum' | grep -c 'team="team-agents"' || true)
+  kill $PF; wait $PF 2>/dev/null || true
+else
+  ATTRIBUTED="port-forward on 18082 did not start"
+fi
+record "Step 20" "Token metric series attributed to team-agents" "${ATTRIBUTED}" '^[1-9][0-9]*$'
+record "Step 20" "Team token cap" "$(kubectl get agentgatewaypolicy team-token-caps -n agentgateway-system \
+  -o jsonpath='{.spec.traffic.rateLimit.local[0].tokens}/{.spec.traffic.rateLimit.local[0].unit} {range .status.ancestors[*].conditions[*]}{.type}={.status} {end}')" \
+  '^200000/Hours Accepted=True Attached=True'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+PASS  Steps 2, 7     Model call at the gateway, from Substrate egress: http.status=200
+PASS  Step 19        Tool call at the MCP server: source, credential: 10.244.0.6 bearer-match
+PASS  Step 20        Token metric series attributed to team-agents: 4
+PASS  Step 20        Team token cap: 200000/Hours Accepted=True Attached=True 
+```
+
+**The fences and the other user.** Pods that are not supposed to reach the gateway, the snapshot
+store or the controller, and bob trying to continue alice's session:
+
+```bash run id=step-29-fences
+from_pod() {
+  kubectl run "validate-$1" -n default --rm -i --restart=Never --image=busybox:1.36 --quiet -- \
+    sh -c "wget -T 8 -O /dev/null $2 2>&1 | tail -1" < /dev/null
+}
+record "Step 5" "Another pod reaching the gateway" "$(from_pod gateway http://agentgateway-proxy.agentgateway-system.svc.cluster.local/v1/messages)" 'timed out'
+record "Step 21" "Another pod reaching the snapshot store" "$(snapshot_ls "kagent/" | tail -1)" '[Tt]imeout'
+record "Step 23" "Another pod reaching the controller" "$(from_pod controller http://kagent-controller.kagent.svc.cluster.local:8083/health)" 'timed out'
+record "Step 23" "bob continuing alice's session" "$(KAGENT_AS=bob kagent_send deployment-helper "hello" "$VALIDATE_CONV" | cut -f1,3 | tr '\t' ' ')" '^NO_TASK task not found$'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+PASS  Step 5         Another pod reaching the gateway: wget: download timed out
+PASS  Step 21        Another pod reaching the snapshot store: Connect timeout on endpoint URL: "http://rustfs.ate-system.svc:9000/ate-snapshots?list-type=2&prefix=kagent%2F&encoding-type=url"
+PASS  Step 23        Another pod reaching the controller: wget: download timed out
+PASS  Step 23        bob continuing alice's session: NO_TASK task not found
+```
 
 ### Step 30: Map each result to the step that set it
 
-*Not yet written.*
+```bash run id=step-30-summary
+printf '%s' "$VALIDATE_RESULTS" | awk -F'|' 'NF >= 3 {printf "%-4s  set in %-13s  %s\n", $1, $2, $3}'
+FAILED=$(printf '%s' "$VALIDATE_RESULTS" | grep -c '^FAIL' || true)
+echo "checks: $(printf '%s' "$VALIDATE_RESULTS" | grep -c '|' || true), failed: ${FAILED}"
+```
+
+**Verified on 2026-11-03:**
+
+```text
+PASS  set in Step 22        Keycloak token for alice
+PASS  set in Step 22        UI with no sign-in
+PASS  set in Step 22        API call with no token
+PASS  set in Steps 6, 19    Turn using the model and the MCP tool
+PASS  set in Step 9         First restore of the session's actor
+PASS  set in Step 9         Actor state after the turn
+PASS  set in Step 10        Spans in the session's trace
+PASS  set in Step 15        Kernel the agent sees
+PASS  set in Step 17        Model credential the agent holds
+PASS  set in Step 17        Consumer key in the sandbox's filesystem
+PASS  set in Step 18        A destination outside the egress policy
+PASS  set in Steps 2, 7     Model call at the gateway, from Substrate egress
+PASS  set in Step 19        Tool call at the MCP server: source, credential
+PASS  set in Step 20        Token metric series attributed to team-agents
+PASS  set in Step 20        Team token cap
+PASS  set in Step 5         Another pod reaching the gateway
+PASS  set in Step 21        Another pod reaching the snapshot store
+PASS  set in Step 23        Another pod reaching the controller
+PASS  set in Step 23        bob continuing alice's session
+checks: 19, failed: 0
+```
+
+Every check names the step that set it up, so a `FAIL` sends you back to one place. Read them in the
+order a turn passes through the platform:
+
+| Order | Control | Set in | Checked by |
+|---|---|---|---|
+| 1 | The caller signs in to Keycloak, and oauth2-proxy and the controller refuse anyone who has not | Step 22 | Keycloak token, UI with no sign-in, API call with no token |
+| 2 | Only the session's creator can continue it | Step 23 | bob continuing alice's session |
+| 3 | Nothing in the cluster reaches the controller except the UI and Substrate's egress gateway, so no pod can present a forged identity | Step 23 | Another pod reaching the controller |
+| 4 | Substrate restores the session's actor from the agent's golden snapshot | Step 9 | First restore |
+| 5 | The agent runs in its own gVisor sandbox | Step 15 | Kernel the agent sees |
+| 6 | The agent holds a placeholder, not a key | Step 17 | Model credential, consumer key in the filesystem |
+| 7 | Substrate's egress gateway allows only the destinations in the policy | Step 18 | A destination outside the policy |
+| 8 | Substrate's egress gateway injects the consumer key and sends the call to agentgateway, which nothing else can reach | Steps 2, 5, 7 | Model call at the gateway, another pod reaching the gateway |
+| 9 | agentgateway attributes the tokens and caps the team's use | Step 20 | Token metrics, team token cap |
+| 10 | Tool calls reach the MCP server through agentgateway, with the server's credential added there | Step 19 | Tool call at the MCP server |
+| 11 | Every hop of the turn is traced | Step 10 | Spans in the session's trace |
+| 12 | When the turn ends, the session is checkpointed to the fenced snapshot store and suspended | Steps 9, 21 | Actor state after the turn, another pod reaching the store |
 
 ### What you built
 
-*Not yet written.*
+A platform that runs agents the way a cluster runs any shared service, with the per-session
+isolation an agent needs, from open-source projects only:
+
+- **kagent** declares agents as Kubernetes resources and turns each session into a Substrate
+  actor. Two runtimes, the kagent Go ADK and Claude Code, behind the same declaration, installed
+  with one `kagent install`.
+- **Agent Substrate** runs each session in its own gVisor sandbox on a shared pool of workers,
+  restores it from a snapshot when a message arrives, and suspends it when the turn ends, so a
+  waiting session holds no memory.
+- **Every credential stays outside the agent.** Substrate's egress gateway injects the consumer key
+  on the way out, and the actor can reach only the destinations kagent put in its policy.
+- **agentgateway** is the one path to the model and to MCP tools: it holds the provider key and the
+  tool server's credential, authenticates the team's consumer key, attributes every token and caps
+  the team's use, and nothing else in the cluster can reach it.
+- **Session data** sits in a snapshot store only atelet and ate-api can reach, under credentials
+  you generated.
+- **Keycloak**, through oauth2-proxy, signs in every caller of the UI and API, and a session belongs
+  to the user who started it. Every signed-in user can see and change every agent: open-source
+  kagent has no roles.
+
+What it does not do yet is in Before production.
 
 ## Before production
 
