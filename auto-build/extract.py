@@ -37,8 +37,8 @@ import sys
 CREDENTIALS = ["ANTHROPIC_API_KEY"]
 
 # Each value is read back from where the guide stored it. The consumer key comes from the gateway's
-# Secret (Step 2). A conversation ID is the oldest actor of that agent's template. The sign-in
-# values are added here when the step that creates them is written.
+# Secret (Step 2), the sign-in values from Keycloak's Secrets and the kagent release (Step 22). A
+# conversation ID is the oldest actor of that agent's template.
 RESTORE = """\
 sec() { kubectl get secret "$2" -n "$1" -o jsonpath="{.data.$3}" 2>/dev/null | base64 --decode || true; }
 if kubectl get secret llm-virtual-keys -n agentgateway-system >/dev/null 2>&1; then
@@ -53,7 +53,14 @@ oldest_conv() {
 setif() { if [ -n "$2" ]; then export "$1=$2"; fi; }
 setif FIRST_CONTEXT "$(oldest_conv assistant)"
 setif CLAUDE_CONTEXT "$(oldest_conv assistant-claude-code)"
-setif MCP_SERVER_TOKEN "$(sec mcp-tools deployment-codes-token MCP_TOKEN)\""""
+setif MCP_SERVER_TOKEN "$(sec mcp-tools deployment-codes-token MCP_TOKEN)"
+setif KEYCLOAK_ADMIN_PASSWORD "$(sec keycloak keycloak-admin password)"
+setif KAGENT_OIDC_CLIENT_SECRET "$(sec keycloak keycloak-realm 'realm\\.json' | jq -r '.clients[]? | select(.clientId == "kagent-ui") | .secret' 2>/dev/null)"
+setif KAGENT_COOKIE_SECRET "$(helm get values kagent -n kagent -o json 2>/dev/null | jq -r '."oauth2-proxy".config.cookieSecret // empty' 2>/dev/null)"
+for u in alice bob; do
+  v=$(sec keycloak keycloak-realm 'realm\\.json' | jq -r --arg u "$u" '.users[]? | select(.username == $u) | .credentials[0].value' 2>/dev/null)
+  if [ -n "$v" ]; then export "KAGENT_$(echo "$u" | tr '[:lower:]' '[:upper:]')_PASSWORD=$v"; fi
+done"""
 
 
 
