@@ -26,6 +26,11 @@ turn went through it.
 **Validate** sends one session through every control and maps each result to the step that
 set it.
 
+**Why Anthropic.** Step 14 runs Claude Code, which calls only Anthropic's API, so the guide uses
+Anthropic for both runtimes: one backend, one provider key and one token cap at the gateway. Nothing
+else in the stack depends on it. kagent and agentgateway work with other providers, and Attachment D
+runs Up and Running and Operate on OpenAI, with OpenAI Codex in Step 14.
+
 **The order matters.** Isolate closes things Up and Running leaves open, in particular sign-in, so
 do not expose this cluster to anyone until Isolate is done.
 
@@ -95,7 +100,7 @@ export KEYCLOAK_PORT=${KEYCLOAK_PORT:-18080}
 # The S3 client Step 12 uses to read the snapshot store.
 export AWS_CLI_IMAGE=amazon/aws-cli:2.17.0@sha256:643507c10ada7964ca6157b3d799f030b90577643da9955d319a77399ed80d73
 
-# Model provider. Anthropic is the reference provider.
+# Model provider. Anthropic, because Step 14 runs Claude Code. Attachment D uses OpenAI instead.
 export ANTHROPIC_API_KEY='<your-anthropic-api-key>'
 export MODEL=claude-haiku-4-5
 
@@ -118,8 +123,8 @@ export JAEGER_PORT=${JAEGER_PORT:-16686}
 | Docker on a machine with 6 CPU and 12 GiB for it | Everything | The reference environment is Colima on macOS (`colima start --cpu 6 --memory 12`). |
 | `kind` 0.32.0, `kubectl`, `helm`, `jq`, `curl`, `openssl` | Everything | |
 | `zstd` | Isolate | Decompresses a snapshot to search it |
-| Anthropic API key | Step 2 | It is stored once, in the gateway. Nothing else holds it. |
-| Egress from the cluster to `ghcr.io`, `cr.agentgateway.dev`, `docker.io` and `api.anthropic.com` | Everything | Images, and the model calls |
+| Anthropic API key, or an OpenAI key with Attachment D | Step 2 | It is stored once, in the gateway. Nothing else holds it. |
+| Egress from the cluster to `ghcr.io`, `cr.agentgateway.dev`, `docker.io` and `api.anthropic.com` (`api.openai.com` with Attachment D) | Everything | Images, and the model calls |
 | Access from your machine to `github.com` and `cr.agentgateway.dev` | Steps 2 and 3 | The Gateway API CRDs, the kagent CLI and kubectl-ate from GitHub releases (the CLIs checked against a sha256), and agentgateway's charts |
 
 > [!WARNING]
@@ -1558,7 +1563,7 @@ Four harness kinds exist on this release, and an Agent's harness names exactly o
 |---|---|---|
 | `kagent` | kagent's Go ADK runtime | Steps 6 to 13 |
 | `claude` | Claude Code | This step |
-| `codex` | OpenAI Codex | Not covered: not verified on this release |
+| `codex` | OpenAI Codex | Attachment D, with an OpenAI key |
 | `byo` | Your own image | Not covered: see below |
 
 Every harness in this guide names its image in `workload.image`, pinned by digest. Only `byo` must:

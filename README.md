@@ -51,8 +51,8 @@ stated at the top of the guide.
 |---|---|
 | Docker with 6 CPU and 12 GiB | The reference environment is Colima on macOS |
 | `kind` 0.32.0, `kubectl`, `helm`, `jq`, `curl`, `openssl`, `zstd` | Standard tooling |
-| An Anthropic API key | Stored once, in the gateway; no agent holds it |
-| Network access to `ghcr.io`, `docker.io`, `github.com` and `api.anthropic.com` | Images, pinned downloads and the model calls |
+| An Anthropic API key, or an OpenAI key with Attachment D | Stored once, in the gateway; no agent holds it |
+| Network access to `ghcr.io`, `docker.io`, `github.com` and `api.anthropic.com` (`api.openai.com` with Attachment D) | Images, pinned downloads and the model calls |
 
 The `kagent` CLI and `kubectl-ate` are downloaded by the guide at pinned versions.
 
@@ -85,8 +85,8 @@ auto-build/run.sh
 ```
 docs/
   deployment-guide.md   The guide. Read this first.
-  attachments.md        Attachments A (sign-in), B (clusters without the beta certificates API)
-                        and C (troubleshooting)
+  attachments.md        Attachments A (sign-in), B (clusters without the beta certificates API),
+                        C (troubleshooting) and D (OpenAI in place of Anthropic)
 auto-build/
   run.sh                Runs the guide's blocks verbatim against the current cluster
   extract.py            Pulls the runnable blocks out of the guide, in document order

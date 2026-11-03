@@ -13,6 +13,7 @@ that fails is a guide problem, and the fix goes in `docs/`, not here.
 ## Credentials
 
 One, the same one the guide's environment setup block sets to a placeholder: `ANTHROPIC_API_KEY`.
+Attachment D also needs `OPENAI_API_KEY`, which its own environment block sets to a placeholder.
 
 Export it, or put it in `auto-build/.env.local` (gitignored):
 
@@ -37,7 +38,8 @@ auto-build/run.sh --shell zsh         # run it under zsh (default: bash)
 auto-build/run.sh --in-order          # every block in document order, when=manual ones included
 auto-build/extract.py docs/deployment-guide.md --list   # block IDs, in order
 
-auto-build/run.sh --attachment docs/attachments.md   # Attachment B's path
+auto-build/run.sh --attachment docs/attachments.md --part b   # Attachment B's path
+auto-build/run.sh --attachment docs/attachments.md --part d --to d-step-14-codex-turn   # OpenAI, Attachment D
 ```
 
 It runs against whatever `KUBECONFIG` points at, from a new, empty directory outside the repository
@@ -93,9 +95,16 @@ closed, and the check catches anything that ends a run early some other way.
 `docs/attachments.md` holds two kinds of runnable block.
 
 **Replacements.** A block tagged `replaces=<id>` runs in place of the guide's block `<id>`, and one
-tagged `after=<id>` runs right after it. Attachment B is written this way: its blocks change Up and
-Running for a cluster without the beta certificates API without copying the rest of it. With
-`--attachment`, `--from` and `--to` work on the merged sequence, and `--list` shows each block's tag.
+tagged `after=<id>` runs right after it. Attachments B and D are written this way: B's blocks change
+Up and Running for a cluster without the beta certificates API, and D's run Up and Running and
+Operate on OpenAI, without copying the rest of the guide. `--part <letter>` applies only the blocks
+of that attachment, whose ids start with `<letter>-`; without it, every attachment's replacements
+apply. With `--attachment`, `--from` and `--to` work on the merged sequence, and `--list` shows each
+block's tag.
+
+A block tagged `after=environment-setup-env` belongs to the environment setup: it always runs, and
+the credentials are applied again after it. `OPENAI_API_KEY`, which only Attachment D uses, is
+optional: `run.sh` passes it on when it is set.
 
 **Standalone blocks.** Attachment A's check and Attachment C's fixes are untagged and `when=manual`,
 because each applies only in a particular situation. They run only when named with `--only`.

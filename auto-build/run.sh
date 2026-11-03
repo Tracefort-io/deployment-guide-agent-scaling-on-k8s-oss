@@ -30,6 +30,11 @@ for c in $CREDS; do
   fi
   export "__CRED_$c=$v"
 done
+# Optional: Attachment D's provider key, used only by its blocks.
+for c in OPENAI_API_KEY; do
+  v="${!c:-}"
+  if [ -n "$v" ] && [ "${v#<}" = "$v" ]; then export "__CRED_$c=$v"; fi
+done
 
 RUN_SHELL=bash; ARGS=()
 while [ $# -gt 0 ]; do

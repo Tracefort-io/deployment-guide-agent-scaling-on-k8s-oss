@@ -13,6 +13,7 @@ never reach a command.
   extract.py <guide.md> --in-order                  every block, manual ones too, as a reader pastes them
   extract.py <guide.md> --list                      block ids, one per line
   extract.py <guide.md> --attachment <file.md> ...  apply an attachment's blocks
+  extract.py <guide.md> --attachment <file.md> --part <letter> ...  only that attachment's blocks
   extract.py <guide.md> [--attachment <f>] --only <id>[,<id>...]
 
 The shell setup block (`shell-setup`) and the environment block always run, whatever is selected.
@@ -23,7 +24,12 @@ call), and values a reader's shell would still hold are restored from the cluste
 
 With --attachment, an attachment block tagged `replaces=<id>` runs in place of the
 guide's block <id>, and one tagged `after=<id>` runs right after it. Untagged
-attachment blocks run only when named with --only.
+attachment blocks run only when named with --only. With --part <letter>, only the attachment
+blocks whose id starts with <letter>- are applied, so one attachment's replacements do not bring in
+another's.
+
+An attachment block tagged `after=environment-setup-env` is part of the environment setup: it
+always runs, and the credentials are applied again after it.
 
 With --in-order, `when=manual` blocks run where they appear, like every other block: what a reader
 gets by pasting the guide top to bottom. It combines with --from and --to.
@@ -34,7 +40,7 @@ and then the named blocks (manual ones included), in the order given.
 import re
 import sys
 
-CREDENTIALS = ["ANTHROPIC_API_KEY"]
+CREDENTIALS = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
 
 # Each value is read back from where the guide stored it. The consumer key comes from the gateway's
 # Secret (Step 2), the sign-in values from Keycloak's Secrets and the kagent release (Step 22). A
@@ -104,6 +110,9 @@ def main():
     found = blocks(args[0])
     attachment = arg(args, "--attachment")
     extra = blocks(attachment) if attachment else []
+    part = arg(args, "--part")
+    if part:
+        extra = [e for e in extra if e[0].startswith(part.lower() + "-")]
     for bid, info, _ in extra:
         target = attr(info, "replaces") or attr(info, "after")
         if target and target not in [b[0] for b in found]:
@@ -125,10 +134,13 @@ def main():
 
     script = ["set -eo pipefail"]
 
+    env_extra = [e[0] for e in extra if attr(e[1], "after") == "environment-setup-env"]
+    always = ALWAYS + tuple(env_extra)
+
     def emit(b):
         script.extend([f"echo '>>>BLOCK {b[0]}'", b[2]])
-        if b[0] == "environment-setup-env":
-            script.extend(f'export {c}="$__CRED_{c}"' for c in CREDENTIALS)
+        if b[0] in ("environment-setup-env", *env_extra):
+            script.extend(f'if [ -n "${{__CRED_{c}:-}}" ]; then export {c}="$__CRED_{c}"; fi' for c in CREDENTIALS)
             script.append('export PATH="$ATE_BIN_DIR:$PATH"')
 
     only = arg(args, "--only")
@@ -138,7 +150,7 @@ def main():
         missing = [w for w in want if w not in index]
         if missing:
             sys.exit("no block with id " + ", ".join(missing))
-        for a in ALWAYS:
+        for a in always:
             emit(index[a])
         script.append(RESTORE)
         for b in merged:
@@ -162,10 +174,10 @@ def main():
             continue
         if n > end:
             break
-        if n < start and not (b[0] in ALWAYS or is_helper(b[0])):
+        if n < start and not (b[0] in always or is_helper(b[0])):
             continue
         emit(b)
-        if b[0] == "environment-setup-env" and frm:
+        if b[0] == always[-1] and frm:
             script.append(RESTORE)
     script.append("echo '>>>DONE'")
     print("\n".join(script))

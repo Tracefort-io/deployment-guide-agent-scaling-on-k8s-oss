@@ -376,3 +376,356 @@ PostgreSQL.
 `connection refused`.** *Reproduced (Before production).* Cause: Keycloak re-imports the realm from
 its Secret when it starts (Attachment A.5), and the port-forward died with the old pod. Fix: re-run
 Step 22's `keycloak-forward` block, and make lasting changes in the realm Secret.
+
+## Attachment D: OpenAI in place of Anthropic
+
+The guide uses Anthropic because Step 14 runs Claude Code, which calls only Anthropic's API, and
+one provider for both runtimes keeps the gateway to one backend, one provider key and one cap.
+Nothing else in the stack depends on Anthropic. This attachment runs Up and Running and Operate on
+OpenAI: the gateway holds an OpenAI key and serves OpenAI's Responses API, kagent's default model
+is an OpenAI model, and Step 14 runs OpenAI Codex instead of Claude Code.
+
+Each block below replaces the guide block it names, or for D.1 runs right after it, and every other
+block runs as the guide has it. Paste these in their place as you go.
+
+**Verified on:** kind cluster `agents` (kind 0.32.0, `kindest/node:v1.35.0`), 2026-11-03 17:08 to
+17:13 UTC: the guide run verbatim from Step 1 through Step 14 with the blocks below in place of the ones they name
+(`auto-build/run.sh --attachment docs/attachments.md --part d --to d-step-14-codex-turn`). Isolate,
+Scale and Validate were not run on OpenAI; D.7 lists what they name.
+
+### D.1 The provider (after `environment-setup-env`)
+
+Run this after the guide's environment block. The Anthropic variables it sets stay unused.
+
+```bash run id=d-provider-env after=environment-setup-env
+# Model provider for Attachment D.
+export OPENAI_API_KEY='<your-openai-api-key>'
+export MODEL=gpt-5.4-mini
+
+# The Codex runtime image for Step 14, pinned by digest: the one the kagent chart ships.
+export CODEX_HARNESS_IMAGE=ghcr.io/kagent-dev/kagent/codex-harness:1.0.0-rc1@sha256:c26d94cc976a9388a77687d4dc932d4cb8e5f814e762ea7fd47cf7167bb30f97
+```
+
+You need egress from the cluster to `api.openai.com` in place of `api.anthropic.com`.
+
+### D.2 The gateway (Step 2)
+
+In place of `secret-anthropic-api-key`:
+
+```bash run id=d-secret-openai-api-key replaces=secret-anthropic-api-key
+kubectl delete secret openai-api-key -n agentgateway-system --ignore-not-found
+printf '%s' "$OPENAI_API_KEY" | kubectl create secret generic openai-api-key \
+  -n agentgateway-system --from-file=Authorization=/dev/stdin
+```
+
+In place of `backend-anthropic-messages`. Both runtimes call OpenAI's Responses API at
+`/v1/responses`: Codex supports no other, so the kagent runtime is set to use it too (D.3).
+
+```bash run id=d-backend-openai-responses replaces=backend-anthropic-messages
+kubectl apply -f- <<EOF
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: openai-responses-backend
+  namespace: agentgateway-system
+spec:
+  ai:
+    provider:
+      openai:
+        model: "${MODEL}"
+  policies:
+    auth:
+      secretRef:
+        name: openai-api-key
+    ai:
+      routes:
+        "/v1/responses": Responses
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: openai-responses
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+    - name: agentgateway-proxy
+      namespace: agentgateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/responses
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: openai-responses-backend
+          namespace: agentgateway-system
+EOF
+```
+
+The guide's `secret-llm-virtual-keys` block runs unchanged. In place of
+`policy-anthropic-messages-apikey-auth`, require the consumer key where OpenAI's SDKs send their
+key, as a Bearer token in `Authorization`:
+
+```bash run id=d-policy-openai-responses-apikey-auth replaces=policy-anthropic-messages-apikey-auth
+kubectl apply -f- <<EOF
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: openai-responses-apikey-auth
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: openai-responses
+  traffic:
+    apiKeyAuthentication:
+      mode: Strict
+      location:
+        header:
+          name: Authorization
+          prefix: "Bearer "
+      secretRef:
+        name: llm-virtual-keys
+EOF
+kubectl wait agentgatewaypolicy/openai-responses-apikey-auth -n agentgateway-system \
+  --for=jsonpath='{.status.ancestors[0].conditions[?(@.type=="Attached")].status}'=True --timeout=60s
+```
+
+The gateway replaces the consumer key with the OpenAI key on the way out, so OpenAI never sees the
+consumer key. In place of `step-2-gateway-check`:
+
+```bash run id=d-step-2-gateway-check replaces=step-2-gateway-check
+kubectl --context "kind-${KIND_CLUSTER_NAME}" port-forward --address 127.0.0.1 -n agentgateway-system deployment/agentgateway-proxy 18081:80 >/dev/null 2>&1 &
+GW_PF=$!
+sleep 3
+MSG="{\"model\":\"${MODEL}\",\"max_output_tokens\":64,\"input\":\"Reply with exactly: gateway ok\"}"
+echo -n "no key:       "; curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18081/v1/responses \
+  -H 'content-type: application/json' -d "$MSG"
+echo -n "consumer key: "; curl -sS http://127.0.0.1:18081/v1/responses \
+  -H 'content-type: application/json' -H "Authorization: Bearer ${AGENT_CONSUMER_KEY}" -d "$MSG" \
+  | jq -r '([.output[]? | select(.type == "message") | .content[]?.text] | join("")) as $t | if $t != "" then $t else .error.message end'
+kill $GW_PF; wait $GW_PF 2>/dev/null || true
+```
+
+**Verified on 2026-11-03:**
+
+```text
+no key:       401
+consumer key: gateway ok
+```
+
+As in the guide: a 401 with no key and an answer with the consumer key. An `Incorrect API key`
+error on the second line comes from OpenAI: fix `OPENAI_API_KEY` and run
+`d-secret-openai-api-key` again.
+
+### D.3 kagent (Steps 3 and 4)
+
+In place of `install-kagent`. The kagent CLI reads the default model's key from `OPENAI_API_KEY`
+for the OpenAI provider, and the values file sets the gateway as the base URL and the Responses API
+as the format. OpenAI's base URL includes `/v1`:
+
+```bash run id=d-install-kagent replaces=install-kagent
+: "${AGENT_CONSUMER_KEY:?is empty: Step 2 exported it in another shell. Read it back first (Step 3).}" && {
+KAGENT_CLI_DIR=$(mktemp -d)
+cat > "$KAGENT_CLI_DIR/config.yaml" <<EOF
+install:
+  defaultModelProvider: OpenAI
+  kagent:
+    valuesFiles:
+      - kagent-values.yaml
+EOF
+cat > "$KAGENT_CLI_DIR/kagent-values.yaml" <<EOF
+providers:
+  openAI:
+    model: ${MODEL}
+    config:
+      baseUrl: http://agentgateway-proxy.agentgateway-system.svc.cluster.local/v1
+      apiFormat: responses
+EOF
+OPENAI_API_KEY="$AGENT_CONSUMER_KEY" kagent --config "$KAGENT_CLI_DIR/config.yaml" install --profile minimal
+rm -rf "$KAGENT_CLI_DIR"
+}
+```
+
+**Verified on 2026-11-03:**
+
+```text
+kagent installed successfully
+```
+
+The `OPENAI_API_KEY=` in front of the command applies to that command only, so the real key in your
+shell is not replaced, and is not used.
+
+In place of `step-4-default-model`:
+
+```bash run id=d-step-4-default-model replaces=step-4-default-model
+kubectl get modelconfig default-model-config -n kagent \
+  -o jsonpath='{.spec.provider} {.spec.model} {.spec.openAI.baseUrl} {.spec.openAI.apiFormat} {.spec.apiKeySecret}{"\n"}'
+held=$(kubectl get secret kagent-openai -n kagent -o jsonpath='{.data.OPENAI_API_KEY}' | base64 --decode)
+[ "$held" = "$AGENT_CONSUMER_KEY" ] && echo "kagent-openai holds the gateway consumer key" \
+  || echo "kagent-openai does NOT hold the consumer key"
+unset held
+```
+
+**Verified on 2026-11-03:**
+
+```text
+OpenAI gpt-5.4-mini http://agentgateway-proxy.agentgateway-system.svc.cluster.local/v1 responses kagent-openai
+kagent-openai holds the gateway consumer key
+```
+
+### D.4 The first turn (Step 7)
+
+The guide's Step 7 blocks run unchanged except the gateway log, which names the route. The session's
+egress policy from `step-7-egress-policy` now replaces `authorization` with the consumer key, from
+the Secret `kagent-openai`, and kagent adds an `api.openai.com` rule with no credential on it, as it
+does for Anthropic:
+
+```text
+http	agentgateway-proxy.agentgateway-system.svc.cluster.local:80	authorization <- ate-secret://k8s.io/default/kagent/kagent-openai/OPENAI_API_KEY
+http	kagent-controller.kagent.svc.cluster.local:8083	authorization <- actor JWT, audience kagent-runtime, 300s
+https	api.openai.com:443	
+```
+
+In place of `step-7-gateway-log`:
+
+```bash run id=d-step-7-gateway-log replaces=step-7-gateway-log
+EGRESS_IP=$(kubectl get pod -n ate-system -l app=atenet-egress -o jsonpath='{.items[0].status.podIP}')
+echo "atenet-egress: ${EGRESS_IP}"
+kubectl logs -n agentgateway-system deployment/agentgateway-proxy --since=10m \
+  | grep 'route=agentgateway-system/openai-responses' | grep "src.addr=${EGRESS_IP}:" | tail -1 \
+  | tr ' ' '\n' | grep -E '^(route|src.addr|http.status|gen_ai.usage.input_tokens|gen_ai.usage.output_tokens|endpoint)='
+```
+
+**Verified on 2026-11-03:**
+
+```text
+atenet-egress: 10.244.0.20
+route=agentgateway-system/openai-responses
+endpoint=api.openai.com:443
+src.addr=10.244.0.20:51492
+http.status=200
+gen_ai.usage.input_tokens=889
+gen_ai.usage.output_tokens=7
+```
+
+### D.5 The trace (Step 10)
+
+In place of `step-10-read-trace`, which selects spans by the provider's path and host:
+
+```bash run id=d-step-10-read-trace replaces=step-10-read-trace
+kubectl --context "kind-${KIND_CLUSTER_NAME}" port-forward --address 127.0.0.1 -n observability service/jaeger ${JAEGER_PORT}:16686 >/dev/null 2>&1 &
+JAEGER_PF=$!
+sleep 10
+TRACE=$(curl -sS "http://127.0.0.1:${JAEGER_PORT}/api/traces?service=assistant&limit=1&lookback=15m")
+echo "$TRACE" | jq -r '.data[0] as $t | "trace \($t.traceID): \($t.spans | length) spans",
+  ($t.spans | sort_by(.startTime) | .[]
+    | select(.operationName | test("^(POST /agents|invoke_agent|generate_content|POST /v1/responses|POST api.openai)"))
+    | "\($t.processes[.processID].serviceName)\t\(.operationName)\t\(.duration / 1000 | floor) ms")'
+echo "-- the gateway's span:"
+echo "$TRACE" | jq -r '.data[0] as $t | $t.spans[]
+  | select($t.processes[.processID].serviceName == "agentgateway-proxy" and (.operationName | startswith("POST /v1/responses")))
+  | .tags[] | select(.key | test("^(route|http.response.status_code|gen_ai.request.model|gen_ai.usage.input_tokens|gen_ai.usage.output_tokens)$"))
+  | "\(.key)=\(.value)"'
+kill $JAEGER_PF; wait $JAEGER_PF 2>/dev/null || true
+```
+
+**Verified on 2026-11-03:**
+
+```text
+trace 9c7ba5ac838e2b0fe1099933cb48a852: 27 spans
+kagent-controller	POST /agents/	1694 ms
+assistant	invoke_agent assistant	1348 ms
+assistant	generate_content gpt-5.4-mini	1346 ms
+agentgateway-proxy	POST /v1/responses/*	1334 ms
+agentgateway-proxy	POST api.openai.com:443	550 ms
+-- the gateway's span:
+gen_ai.request.model=gpt-5.4-mini
+gen_ai.usage.input_tokens=887
+gen_ai.usage.output_tokens=6
+http.response.status_code=200
+route=agentgateway-system/openai-responses
+```
+
+### D.6 Codex (Step 14)
+
+In place of `harness-claude-code`. The same `assistant` template, on the Codex runtime:
+
+```bash run id=d-harness-codex replaces=harness-claude-code
+kubectl apply -f- <<EOF
+apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata:
+  name: codex
+  namespace: kagent
+spec:
+  codex: {}
+  workload:
+    image: ${CODEX_HARNESS_IMAGE}
+  substrate:
+    workerPoolRef:
+      name: kagent-default
+    snapshotPolicy:
+      location: gs://ate-snapshots/kagent/
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: assistant-codex
+  namespace: kagent
+spec:
+  template:
+    ref:
+      name: assistant
+  harnessRef:
+    name: codex
+EOF
+kubectl wait agent/assistant-codex -n kagent --for=condition=Ready --timeout=300s
+```
+
+**Verified on 2026-11-03:**
+
+```text
+harness.api.kagent.dev/codex created
+agent.api.kagent.dev/assistant-codex created
+agent.api.kagent.dev/assistant-codex condition met
+```
+
+In place of `step-14-claude-code-turn`:
+
+```bash run id=d-step-14-codex-turn replaces=step-14-claude-code-turn
+TURN=$(kagent_send assistant-codex "Reply with exactly: codex harness")
+echo "$TURN"
+export CODEX_CONTEXT=$(echo "$TURN" | cut -f2)
+kubectl-ate get egress-policy "session-${CODEX_CONTEXT}" --atespace kagent -o json 2>/dev/null \
+  | jq -r '.rules[] | to_entries[0] | "\(.key)\t\(.value.hostnames[0]):\(.value.ports.numbers[0])\t\([.value.effects.replaceHeaders[]? | "\(.header) <- \(.credentialUri // "actor JWT, audience \(.actorJwt.audiences | join(",")), \(.actorJwt.expirationSeconds)s")"] | join(", "))"'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+TASK_STATE_COMPLETED	01a1a266-ed88-7a93-858a-5aa68d694e10	codex harness
+http	agentgateway-proxy.agentgateway-system.svc.cluster.local:80	authorization <- ate-secret://k8s.io/default/kagent/kagent-openai/OPENAI_API_KEY
+http	jaeger.observability.svc.cluster.local:4317	
+http	kagent-controller.kagent.svc.cluster.local:8083	authorization <- actor JWT, audience kagent-runtime, 300s
+```
+
+As with Claude Code, the Codex actor's allowlist has no `api.openai.com` rule, so it can reach the
+provider only through the gateway.
+
+### D.7 The rest of the guide
+
+Isolate, Scale and Validate were not run on OpenAI. Their blocks name the Anthropic resources from
+Steps 2 and 3, the `/v1/messages` path and `x-api-key` header, and `assistant-claude-code`. To run
+them on OpenAI, change them as D.2 to D.6 change Up and Running and Operate:
+
+- **Routes and policies:** `anthropic-messages` becomes `openai-responses`, in Step 20's token cap
+  and in the log checks in Steps 20 and 29.
+- **Requests made by hand:** Step 17's injected call and Step 18's allowlist test use
+  `/v1/responses` with a Bearer `Authorization` header, and Step 18 tests `api.openai.com`.
+- **The model key:** `kagent-anthropic` and `ANTHROPIC_API_KEY` become `kagent-openai` and
+  `OPENAI_API_KEY`, in Step 19's agent, in Steps 16 and 17's searches and in Step 29.
+- **The second runtime:** `assistant-claude-code` and `CLAUDE_CONTEXT` become `assistant-codex`
+  and `CODEX_CONTEXT`.
