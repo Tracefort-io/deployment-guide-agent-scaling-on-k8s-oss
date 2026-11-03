@@ -102,7 +102,11 @@ disagree about what is being deployed.
 
 ## Releases
 
-Each certified state of the guide is tagged. None yet.
+Each certified state of the guide is tagged:
+
+| Tag | Certified against |
+|---|---|
+| `certified-rc1` | kagent 1.0.0-rc1, Agent Substrate v1.0.0-rc1 and agentgateway v1.7.0, in four modes, with OpenAI (Attachment D) verified through Step 14 |
 
 The guide documents a validated deployment at a point in time. It does not cover upgrade paths
 between product versions; a fresh install of the pinned set is the only path it verifies.
