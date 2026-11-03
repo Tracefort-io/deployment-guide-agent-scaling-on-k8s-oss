@@ -3043,25 +3043,387 @@ every signed-in user can change every agent.
 
 ## SCALE
 
+Isolate made each session its own sandbox. This section is about what that costs: what a session
+holds while it waits, what it holds while it runs, and how to size the worker pool from that.
+
+**What you are going to do:** measure Substrate's own footprint and compare it with running agents
+as pods, watch memory follow turns in flight, measure what suspended sessions leave behind, size
+the worker pool, and change it safely.
+
+**What you will have that you did not have before:** numbers to size a platform with, the method to
+re-measure them on your own nodes, and a way to change the worker pool without losing capacity.
+
+The steps you run here make five model calls in total and finish in a few minutes. Figures not
+measured by a block in this section are labelled as reference measurements, with where they come
+from. From here on, every turn is alice's: sessions started before Step 22 belong to the built-in
+user the API assumed with no sign-in, and are out of reach now that every caller signs in.
+
+**Verified on:** a kind cluster created fresh for it (kind 0.32.0, `kindest/node:v1.35.0`), 2026-11-03 06:51 UTC: every block from the top of this guide to the end of Step 28 executed verbatim in one pass of `auto-build/run.sh` under bash, from an empty directory outside the repository. Every output block in Scale comes from that run.
+
 ### Step 24: A pod per session, a pod per agent, or Substrate
 
-*Not yet written.*
+*No runtime: one reading from your cluster, and reference measurements.*
+
+There are two ways to run agents as ordinary pods, and they are not the same comparison:
+
+- **A pod per agent**: one long-lived process serves every session with that agent. It is the
+  cheapest thing you can run. **It uses less memory than Substrate at every load measured**, because
+  it adds almost nothing per session. What it gives up is everything Isolate built: all of an
+  agent's sessions, for every user, share one process, one memory space and one kernel, and the
+  process holds the model key in its environment.
+- **A pod per session**: the plain-Kubernetes way to get Substrate's isolation, one sandboxed pod
+  for each open session. It holds its memory whether the session is active or waiting for someone
+  to reply.
+
+Substrate is the second model without its standing memory: a session holds memory only while a
+turn is running. While it waits, it is a snapshot in the store and rows in PostgreSQL, tens of
+kilobytes in all (Step 26), instead of tens of megabytes of memory.
+
+What Substrate adds is fixed: its control plane. Read it from the node, as the working set of every
+container in `ate-system` and the pod certificate controller's namespace. That includes RustFS, the
+bundled snapshot store, which a production install replaces with an external object store:
+
+```bash run id=step-24-control-plane
+docker exec "${KIND_CLUSTER_NAME}-control-plane" crictl stats -o json \
+  | jq -r '[.stats[] | select(.attributes.labels["io.kubernetes.pod.namespace"] | IN("ate-system", "podcertificate-controller-system"))
+            | {c: .attributes.labels["io.kubernetes.container.name"], m: ((.memory.workingSetBytes.value // "0") | tonumber)}]
+           | (group_by(.c) | map("  \(.[0].c): \(map(.m) | add / 1048576 | floor) MiB") | .[]),
+             "Substrate control plane, in all: \(map(.m) | add / 1048576 | floor) MiB"'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+  agentgateway: 31 MiB
+  ate-api-server: 58 MiB
+  ate-controller: 15 MiB
+  ate-idp-server: 15 MiB
+  atelet: 16 MiB
+  controller: 8 MiB
+  create-bucket: 0 MiB
+  k8s-credential-provider: 7 MiB
+  objectstore-plugin: 44 MiB
+  rustfs: 91 MiB
+Substrate control plane, in all: 290 MiB
+```
+
+`agentgateway` is the two atenet pods, the egress gateway and the router, and `objectstore-plugin`
+is the sidecar that gives atelet and ate-api their access to the store.
+
+**Reference measurements** for the pod side. These were measured on 2026-10-14 for this guide's
+companion, the Solo Enterprise for kagent guide, on the same reference environment: one kind node,
+Kubernetes 1.35.0, Colima on Apple silicon with 6 vCPU and 12 GiB. They are the same kagent Go ADK
+runtime image, run as ordinary pods, so they do not depend on which distribution of kagent runs
+the platform; they were not repeated for this guide. Memory is the node's used memory before and
+after (from `/proc/meminfo`), divided by the number of units. The pod-per-session comparator is one
+pod of the kagent runtime, run eight times under gVisor through a RuntimeClass with the same gVisor
+build Substrate uses, on a separate throwaway kind cluster, because Substrate's nodes do not
+register gVisor as a container runtime. The same pod under runc is included as the comparator most
+favourable to pods.
+
+| | Memory per unit | Storage per unit | Unit | Measured |
+|---|---|---|---|---|
+| Substrate control plane | 290 MiB | | Fixed, once per cluster | Above |
+| Substrate, a turn in flight | about 37 MiB | | Per running turn, released when it ends | Step 25 |
+| Substrate, a suspended session | 0 | about 56 KiB | Per session, while it waits | Step 26 |
+| Substrate, an agent | | about 48 KiB | Golden snapshot, per agent revision | Step 26 |
+| Pod per session, gVisor | 59.7 MiB | | Per open session, active or not | Reference |
+| Pod per session, runc (weaker isolation) | 13.4 MiB (PSS) | | Per open session, active or not | Reference |
+| Pod per agent, runc | 13.4 MiB (PSS) | | Per agent | Reference |
+
+The runc figure is the pod's proportional share of memory (PSS), not the node's: at about 13 MiB a
+pod, the node's own figure moved by more than that between samples. None of the pod figures
+include a turn's own cost, which can only add to the pod side. The kagent platform itself
+(controller, UI, PostgreSQL) is needed either way and is left out of every figure.
+
+**Projected from those constants**, at 100 open sessions with one agent:
+
+| Turns in flight | Substrate memory | Substrate storage | Pod per session, gVisor | Pod per session, runc | Pod per agent |
+|---|---|---|---|---|---|
+| 5 | 0.48 GiB | about 6 MB | 5.8 GiB, plus turn cost | 1.3 GiB, plus turn cost | 13 to 60 MiB, plus turn cost |
+| 10 | 0.66 GiB | about 6 MB | 5.8 GiB, plus turn cost | 1.3 GiB, plus turn cost | 13 to 60 MiB, plus turn cost |
+| 25 | 1.21 GiB | about 6 MB | 5.8 GiB, plus turn cost | 1.3 GiB, plus turn cost | 13 to 60 MiB, plus turn cost |
+
+Substrate memory is the control plane, one idle worker at about 20 MiB, and 37 MiB per
+turn in flight. Its storage is 100 suspended sessions in the store plus one golden snapshot; the
+pods need none of that, and hold their memory instead.
+
+Against equal isolation, Substrate uses less memory at every load, and the gap grows with every
+session held open, because a waiting session costs kilobytes of storage rather than tens of
+megabytes of memory. Against a pod per agent, Substrate always costs more, and buys isolation per
+session with it.
 
 ### Step 25: Memory follows turns in flight
 
-*Not yet written.*
+*Runtime: kagent.*
+
+Measure it on your own cluster. These helpers read the worker pods' memory from the node (the
+working set of each worker's container, through `crictl`) and count the actors running right now:
+
+```bash run id=step-25-helpers
+# worker_total: summed working set of the worker containers, in MiB.
+worker_total() {
+  docker exec "${KIND_CLUSTER_NAME}-control-plane" crictl stats -o json --label io.kubernetes.container.name=worker \
+    | jq '[.stats[].memory.workingSetBytes.value | tonumber] | add / 1048576 | floor'
+}
+
+# running_actors: actors in the kagent atespace that are running now.
+running_actors() {
+  kubectl-ate get actors -a kagent -o json 2>/dev/null | jq '[.actors[] | select(.status.state == "ACTOR_STATE_RUNNING")] | length'
+}
+```
+
+Start four sessions at once as alice, each asking for a long enough answer to stay in flight for a
+few seconds, and sample while they run. The loop watches the four turns by process ID, kept in an
+array so bash and zsh read it the same way: the port-forwards `forwards` started are background jobs
+in the same shell, so waiting for "no background jobs" would never end. In an interactive zsh, lines
+such as `[2] 48213` and `[2]  + done` are its job control reporting the four turns, not errors:
+
+```bash run id=step-25-burst
+BEFORE=$(worker_total); PEAK=$BEFORE; PEAK_RUNNING=0; TURNS=()
+for i in 1 2 3 4; do
+  kagent_send assistant "Write about 250 words on the history of the bicycle." >/dev/null &
+  TURNS+=($!)
+done
+in_flight() { for p in "${TURNS[@]}"; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
+while in_flight; do
+  M=$(worker_total); R=$(running_actors)
+  [ "$M" -gt "$PEAK" ] && PEAK=$M
+  [ "$R" -gt "$PEAK_RUNNING" ] && PEAK_RUNNING=$R
+done
+wait "${TURNS[@]}"
+sleep 5
+AFTER=$(worker_total)
+echo "worker memory before:  ${BEFORE} MiB, 0 turns in flight"
+echo "worker memory peak:    ${PEAK} MiB, up to ${PEAK_RUNNING} turns in flight"
+echo "worker memory after:   ${AFTER} MiB, running actors now: $(running_actors)"
+```
+
+**Verified on 2026-11-03:**
+
+```text
+worker memory before:  18 MiB, 0 turns in flight
+worker memory peak:    166 MiB, up to 4 turns in flight
+worker memory after:   20 MiB, running actors now: 0
+```
+
+Memory rises with the turns in flight, about 37 MiB for each, and falls back to where it started
+when they end. The four sessions are still there, suspended, and hold no memory now. A sample can
+miss the very top of the curve, so treat the peak as a lower bound. The companion guide measured
+about 50 MiB per running actor on an earlier release, by holding actors running deliberately; the
+figure here comes from four short turns.
+
+Those turns also used CPU, which is what actually limits a node. In a reference run for the
+companion guide (2026-10-11, an earlier release of the same Substrate source, not repeated here),
+with real model calls on one worker, the platform's own share of a turn's latency stayed under
+twice its single-turn value up to **4 concurrent turns per 6-vCPU node**, and doubled beyond that.
+Model time stayed flat; the growth was restore time, consistent with CPU contention (CPU was not
+sampled directly). No turn failed at any concurrency up to 32.
 
 ### Step 26: What suspended sessions leave behind
 
-*Not yet written.*
+*Runtime: kagent. No model calls.*
+
+A suspended session holds no memory, but it is not free. It leaves data in two places, the
+snapshot store and PostgreSQL. Read both, and what the node keeps:
+
+```bash run id=step-26-storage
+echo "sessions in Substrate: $(kubectl-ate get actors -a kagent -o json 2>/dev/null | jq '.actors | length')"
+PV_PATH=$(kubectl get pv "$(kubectl get pvc rustfs-data -n ate-system -o jsonpath='{.spec.volumeName}')" \
+  -o jsonpath='{.spec.hostPath.path}{.spec.local.path}')
+on_node() { docker exec "${KIND_CLUSTER_NAME}-control-plane" sh -c "$1"; }
+echo "-- snapshot store, on disk: $(on_node "du -sh $PV_PATH" | cut -f1) of $(kubectl get pvc rustfs-data -n ate-system -o jsonpath='{.spec.resources.requests.storage}')"
+echo "-- per session in the store, on disk (sessions, KiB each):"
+on_node "du -sk $PV_PATH/ate-snapshots/kagent/atespaces/kagent/actors/*" | awk '{print $1}' | sort -n | uniq -c
+echo "-- per agent revision in the store, golden snapshots (snapshots, KiB each):"
+on_node "du -sk $PV_PATH/ate-snapshots/kagent/atespaces/kagent/tags/*" | awk '{print $1}' | sort -n | uniq -c
+echo "-- PostgreSQL, by schema:"
+kubectl exec -n kagent deployment/kagent-postgresql -c postgresql -- psql -U postgres -d kagent -At -c \
+  "select schemaname || ': ' || pg_size_pretty(sum(pg_total_relation_size(relid))) from pg_statio_user_tables where schemaname in ('kagent','substrate') group by schemaname order by 1"
+echo "-- on the node: actor directories $(on_node 'ls /var/lib/ate/actors | wc -l'), snapshot cache $(on_node 'du -sh /var/lib/ate/snapshot-cache' | cut -f1) ($(on_node 'cat /var/lib/ate/snapshot-cache/entries/*/meta.json' | jq -rs '[.[].key | capture("/atespaces/[^/]+/(?<k>actors|tags)/").k] | group_by(.) | map("\(length) \(.[0]) entries") | join(", ")'))"
+```
+
+**Verified on 2026-11-03:**
+
+```text
+sessions in Substrate: 16
+-- snapshot store, on disk: 1.8M of 1Gi
+-- per session in the store, on disk (sessions, KiB each):
+  13 56
+   1 104
+   2 128
+-- per agent revision in the store, golden snapshots (snapshots, KiB each):
+   4 48
+-- PostgreSQL, by schema:
+kagent: 2840 kB
+substrate: 1024 kB
+-- on the node: actor directories 16, snapshot cache 344K (20 tags entries)
+```
+
+Each session's snapshot takes 56 KiB of the store's volume after a short turn or two, and more as
+the session's database grows: the larger entries are the sessions with the most turns. The objects
+themselves are a few KB compressed (Step 12); the rest is RustFS's directories and metadata. Each
+agent revision adds a 48 KiB golden snapshot, and this cluster has four: two revisions of
+`assistant` (Step 10), and one each of the other two agents.
+
+PostgreSQL is the larger part. Its figures include each table's fixed size, so one sample does not
+give a share per session. A reference measurement for the companion guide, on an earlier release of
+the same kagent source, put kagent's tables at about 14 KB per session after one short turn, 27 KB
+after five and 131 KB after twenty, and Substrate's at 3 to 44 KB.
+
+The node keeps a suspended session's directory, about 48 KiB of its own files, for 30 minutes, so
+that a session resumed soon after restores from the node rather than the store: the `local/volumes`
+restores in Step 9. After that atelet removes it, and the session lives only in the store and
+PostgreSQL; deleting a session removes it at once (Step 13). The snapshot cache holds the agents'
+golden snapshots only. Neither it nor the sandbox asset cache beside it has a size limit by
+default, which atelet logs as a warning when it starts.
+
+| Where | What | Grows |
+|---|---|---|
+| Snapshot store | The session's volumes, compressed | One snapshot per session, replaced at each turn |
+| PostgreSQL | Every task event of every session (`kagent`), and Substrate's actor records (`substrate`) | With every turn; the largest part of a long session |
+| The worker node | Golden snapshots of the agents it has started, and container images | Per agent revision, not per session |
+
+**Projected from those measured constants:** 1,000 suspended sessions of short turns need about 56 MB in the store
+and, from the reference figures, 17 to 175 MB in PostgreSQL; 10,000 need ten times that, and no
+memory at all until someone sends a message. PostgreSQL grows fastest with turns. `kagent install`
+gives PostgreSQL a 500Mi volume and the store 1Gi: size both from this.
 
 ### Step 27: Size the worker pool for concurrent turns
 
-*Not yet written.*
+*No runtime: arithmetic, with one reading from your cluster.*
+
+What a worker can run at once is set by the CPU it advertises, not by how many sessions exist.
+Read what your node and workers offer:
+
+```bash run id=step-27-capacity
+echo "node CPU: $(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.cpu}'), memory: $(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memory}')"
+kubectl-ate get workers 2>/dev/null
+```
+
+**Verified on 2026-11-03:**
+
+```text
+node CPU: 6, memory: 12220308Ki
+NAME                                   POOL             STATE                 ACTORS   CPU(MILLICORES)   MEMORY         POD                                      AGE
+5ddaab8e-6e57-4cbc-afae-21cb4cc5b72d   kagent-default   WORKER_STATE_ACTIVE   0/1000   0/6000            0/12154772Ki   kagent/kagent-default-5ffdf9d9f7-pfqg8   7m38s
+```
+
+Each worker advertises the whole node, and every running actor reserves 1 CPU and 1 GiB of it,
+released when the actor suspends. A worker on this 6-vCPU node therefore runs at most 6 actors at
+once. A turn that finds no room is held for about 5 seconds while Substrate retries placing it, and
+is refused if nothing frees up in that time: the caller gets `input was not accepted; retry after
+the session becomes available`. With one worker on this node, 12 turns sent together on 2026-11-03
+ran at most 6 at once; 10 completed in 3 to 10 seconds, some of them after waiting for a slot, and
+2 were refused after 5 seconds.
+
+The limit is per worker, not per node: two workers on one node each advertise all of it, so
+together they admit twice what its CPU can serve. Size for turns in flight:
+
+| Input | Reference value |
+|---|---|
+| Peak turns in flight | Yours to estimate: sessions active at the busiest moment, not sessions open |
+| Turns per worker | The CPUs its node advertises: 6 on a 6-vCPU node, measured above |
+| Turns per node before latency doubles | 4 per 6-vCPU node, a reference measurement for the companion guide on an earlier release, before actors reserved CPU; not re-measured |
+| Memory per turn in flight | about 37 MiB used (Step 25), 1 GiB reserved from the worker's advertised memory |
+| Fixed control plane | 290 MiB per cluster (Step 24) |
+
+For 10 turns in flight at the busiest moment: one worker per node, and 10 ÷ 6 rounds up to 2 nodes
+of this size before any turn is refused, or 10 ÷ 4 to 3 nodes if you size for the latency figure.
+Memory is about 0.28 GiB for the control plane plus 0.36 GiB used by the turns, though each worker sets aside 1 GiB per running actor. Storage is sized
+from sessions kept, not turns: see Step 26. **Projected, not measured:** that adding nodes adds
+turns at that rate.
+
+Two settings change how the pool behaves under that load. Both are kagent chart values, under
+`substrateWorkerPool`:
+
+- **Worker resources** (`substrateWorkerPool.template.resources`). Requests are the only way to
+  reserve node capacity for workers; without them, as `kagent install` leaves it, nothing reserves
+  room for running actors. Limits become a hard ceiling for everything the worker runs: at about
+  37 MiB per running actor, a 2 GiB limit would be reached near 55 running actors
+  (**projected**; what happens at the ceiling was not tested).
+- **Replicas** (`substrateWorkerPool.replicas`). At least one worker per node you want to use, and
+  enough that a worker restarting does not take your only capacity with it. More than one worker
+  per node raises the admission limit past what the node's CPU can serve.
 
 ### Step 28: Change the worker pool without losing capacity
 
-*Not yet written.*
+*Runtime: kagent. One model call.*
+
+The worker Deployment that Substrate creates for a pool rolls out with `maxSurge: 0`: it removes an
+old worker before starting its replacement. So any change that makes workers roll, such as new
+resources, takes capacity away first, and if the replacement cannot schedule (a request larger than
+the node has free), the pool stays a worker short. The WorkerPool's status does not say why; only
+the Pending pod's event does.
+
+Check the node's headroom before changing worker resources:
+
+```bash run id=step-28-headroom
+kubectl describe node | sed -n '/Allocated resources/,/Events/p' | sed '$d'
+```
+
+**Verified on 2026-11-03:**
+
+```text
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests      Limits
+  --------           --------      ------
+  cpu                2280m (38%)   17600m (293%)
+  memory             3010Mi (25%)  10118Mi (84%)
+  ephemeral-storage  0 (0%)        0 (0%)
+  hugepages-1Gi      0 (0%)        0 (0%)
+  hugepages-2Mi      0 (0%)        0 (0%)
+  hugepages-32Mi     0 (0%)        0 (0%)
+  hugepages-64Ki     0 (0%)        0 (0%)
+```
+
+A worker's new request must fit inside what is not yet requested, or the rollout leaves a worker
+Pending. On the node above, 2280m of the 6 CPUs is requested, so about 3.7 CPUs are free.
+`kagent install` sets no requests on the worker, so this is the room a first request has: one
+larger than that would leave the replacement Pending, with one worker already gone.
+
+The change that never removes capacity is adding a worker. Raise the replica count, wait for the new
+worker, and check it serves:
+
+```bash run id=workerpool-scale-up
+helm upgrade kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent --version ${KAGENT_VERSION} \
+  --namespace kagent --reuse-values --set substrateWorkerPool.replicas=2 --wait --timeout 10m >/dev/null
+for i in $(seq 1 60); do
+  [ "$(kubectl get workerpool kagent-default -n kagent -o jsonpath='{.status.readyReplicas}')" = 2 ] && break
+  sleep 2
+done
+kubectl get workerpool -n kagent
+kubectl-ate get workers 2>/dev/null
+forwards
+kagent_send assistant "Reply with exactly: two workers"
+```
+
+**Verified on 2026-11-03:**
+
+```text
+NAME             DESIRED   REPLICAS   READY   SANDBOXCONFIG    RESOLVED   AGE
+kagent-default   2         2          2       gvisor-default   True       7m51s
+NAME                                   POOL             STATE                 ACTORS   CPU(MILLICORES)   MEMORY         POD                                      AGE
+5ddaab8e-6e57-4cbc-afae-21cb4cc5b72d   kagent-default   WORKER_STATE_ACTIVE   0/1000   0/6000            0/12154772Ki   kagent/kagent-default-5ffdf9d9f7-pfqg8   7m42s
+b2f60400-3953-4984-9378-fa9d9357f0c3   kagent-default   WORKER_STATE_ACTIVE   0/1000   0/6000            0/12154772Ki   kagent/kagent-default-5ffdf9d9f7-rbq7n   2s
+deployment "kagent-controller" successfully rolled out
+deployment "kagent-oauth2-proxy" successfully rolled out
+forwards up: controller 18083, ui (through oauth2-proxy) 14000
+TASK_STATE_COMPLETED	01a1a036-d7e7-798c-ab99-a84a8de94ad2	two workers
+```
+
+`--reuse-values` keeps everything earlier steps set, including the sign-in and the telemetry
+endpoints; without it, Helm would reset them to the chart's defaults, and `kagent install` would
+too, so make later changes with `helm upgrade` rather than by running the install again. Make
+resource changes the same way: add a worker first, so the rollout's missing worker is one you can
+spare, then change the resources, then remove the extra worker. Two workers on this one node now
+admit 12 turns at once on 6 CPUs, which is the over-admission Step 27 describes: on a real cluster,
+add the worker with a node to run it.
+
+**What you now have:** a measured picture of what sessions cost on this platform: memory per turn
+in flight, storage per session waiting, a CPU limit per worker, and a pool you can grow without a
+gap in service.
 
 ## VALIDATE
 
