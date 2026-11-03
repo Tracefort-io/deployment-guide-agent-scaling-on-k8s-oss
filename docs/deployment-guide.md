@@ -107,8 +107,9 @@ export MODEL=claude-haiku-4-5
 # Where the kagent CLI and kubectl-ate are installed in Step 3. Must be on your PATH.
 export ATE_BIN_DIR=${ATE_BIN_DIR:-$HOME/.local/bin}
 
-# Where the sign-in step saves the passwords of the UI users it generates.
-export KAGENT_UI_CREDENTIALS_FILE=${KAGENT_UI_CREDENTIALS_FILE:-$HOME/.kagent-ui-credentials}
+# Where the sign-in step saves the passwords of the UI users it generates. The file is this guide's
+# own, so it does not mix with another guide's users.
+export KAGENT_UI_CREDENTIALS_FILE=${KAGENT_UI_CREDENTIALS_FILE:-$HOME/.kagent-oss-ui-credentials}
 
 # Local ports for the port-forwards.
 export KAGENT_API_PORT=${KAGENT_API_PORT:-18083}
@@ -2568,7 +2569,8 @@ UI passwords are in the file KAGENT_UI_CREDENTIALS_FILE names (Environment setup
 ```
 
 Each value already set in your shell is kept, so the block is safe to run again; the output above is from a shell that already held both passwords. In a new shell,
-`set -a; . ~/.kagent-ui-credentials; set +a` brings the passwords back.
+`set -a; . ~/.kagent-oss-ui-credentials; set +a` brings the passwords back. Sign in to the UI as
+`alice` or `bob`: this guide creates no other UI users.
 
 The realm has two clients and two users. `kagent-ui` is oauth2-proxy's client, confidential, with
 its secret. `kagent-cli` is for scripts: public, with the password grant, and its tokens carry
